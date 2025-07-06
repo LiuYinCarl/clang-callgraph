@@ -6,6 +6,10 @@ from collections import defaultdict
 import sys
 import json
 import yaml
+from pygments import highlight
+from pygments.lexers import CLexer
+from pygments.formatters import TerminalFormatter
+
 """
 Dumps a callgraph of a function in a codebase
 usage: callgraph.py file.cpp|compile_commands.json [-x exclude-list] [extra clang args...]
@@ -20,6 +24,7 @@ callgraph
 CALLGRAPH = defaultdict(list)
 FULLNAMES = defaultdict(set)
 
+g_max_print_depth = 15
 
 def get_diag_info(diag):
     return {
@@ -102,14 +107,22 @@ def pretty_print(n):
         v = ' = 0'
     return fully_qualified_pretty(n) + v
 
+def code_color_pretty(code):
+    formatter = TerminalFormatter()
+    highlight_code = highlight(code, CLexer(), formatter)
+    return highlight_code.rstrip()
 
 def print_calls(fun_name, so_far, depth=0):
+    if depth > g_max_print_depth:
+        return
     if depth >= 15:
         print('...<too deep>...')
         return
     if fun_name in CALLGRAPH:
         for f in CALLGRAPH[fun_name]:
-            print('  ' * (depth + 1) + pretty_print(f))
+            color_code = code_color_pretty(pretty_print(f))
+            print('\033[032m|\033[0m  ' * (depth) + '\033[032m|--\033[0m' + color_code)
+
             if f in so_far:
                 continue
             so_far.append(f)
@@ -117,6 +130,36 @@ def print_calls(fun_name, so_far, depth=0):
                 print_calls(fully_qualified_pretty(f), so_far, depth + 1)
             else:
                 print_calls(fully_qualified(f), so_far, depth + 1)
+
+# func_name1: start func
+# func_name2: target func
+# call_stack: call_stach
+def filter_calls(fun_name1, func_name2, call_stack, so_far, depth=0):
+    if depth > g_max_print_depth:
+        return
+    if depth >= 15:
+        print('...<too deep>...')
+        return
+
+    if fun_name1 in CALLGRAPH:
+        for f in CALLGRAPH[fun_name1]:
+            color_code = code_color_pretty(pretty_print(f))
+            line = '\033[032m|\033[0m  ' * (depth) + '\033[032m|--\033[0m' + color_code
+            call_stack.append(line)
+
+            if func_name2 in f.displayname:
+                for line in call_stack:
+                    print(line)
+
+            if f in so_far:
+                call_stack.pop()
+                continue
+            so_far.append(f)
+            if fully_qualified_pretty(f) in CALLGRAPH:
+                filter_calls(fully_qualified_pretty(f), func_name2, call_stack, so_far, depth+1)
+            else:
+                filter_calls(fully_qualified(f), func_name2, call_stack, so_far, depth+1)
+            call_stack.pop()
 
 
 def read_compile_commands(filename):
@@ -215,15 +258,51 @@ def print_callgraph(fun):
         for f, ff in FULLNAMES.items():
             if f.startswith(fun):
                 for fff in ff:
-                    print(fff)
+                    print(code_color_pretty(fff))
+
+def print_filter_callgraph(fun, target, call_stack):
+    if fun in CALLGRAPH:
+        print(fun)
+        filter_calls(fun, target, call_stack, list())
+    else:
+        print('matching:')
+        for f, ff in FULLNAMES.items():
+            if f.startswith(fun):
+                for fff in ff:
+                    print(code_color_pretty(fff))
 
 
 def ask_and_print_callgraph():
     while True:
-        fun = input('> ')
+        fun = input('\033[31m>>> \033[0m')
         if not fun:
-            break
-        print_callgraph(fun)
+            continue
+
+        fun = fun.lstrip()
+
+        if fun.startswith('?'):
+            args = fun.split(' ', 2)
+            if len(args) != 3:
+                print("invalid args")
+                continue
+            target_keyword = args[1]
+            start_func = args[2]
+            call_stack = []
+            print_filter_callgraph(start_func, target_keyword, call_stack)
+
+        args = fun.split()
+        if len(args) >= 2 and args[0].isdigit():
+            max_depth = int(args[0])
+            if max_depth > 0 and max_depth < 100:
+                global g_max_print_depth
+                g_max_print_depth = max_depth
+                fun = ' '.join(args[1:])
+                print_callgraph(fun)
+            else:
+                print("call depth should be in [1, 15]")
+                continue
+        else:
+            print_callgraph(fun)
 
 
 def main():
