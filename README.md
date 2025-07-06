@@ -1,6 +1,9 @@
 # clang-callgraph
 A Python 3 script based on clang which generates a call graph from a given C++ codebase.
 
+![image](https://github.com/user-attachments/assets/3bb729dc-b61f-4685-b85b-51a60e873096)
+
+
 ## Installation
 Clone the repository, navigate to the repository folder and install it as a Python package:
 ```
