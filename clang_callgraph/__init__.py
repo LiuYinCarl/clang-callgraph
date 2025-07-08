@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
 from pprint import pprint
-from clang.cindex import CursorKind, Index, CompilationDatabase
+from clang.cindex import CursorKind, Index
 from collections import defaultdict
+import readline
 import sys
 import json
 import yaml
+import traceback
 from pygments import highlight
 from pygments.lexers import CLexer
 from pygments.formatters import TerminalFormatter
@@ -21,10 +23,30 @@ prompted to type in the function's name for which you wan to obtain the
 callgraph
 """
 
+## readline
+# readline helper
+
+complete_list = []
+
+def complete(text, state):
+    options = [c for c in complete_list if c.startswith(text)]
+    return options[state] if state < len(options) else None
+
+readline.parse_and_bind("tab: complete")
+readline.set_completer(complete)
+
+def set_complete_list(l):
+    global complete_list
+    complete_list = l
+
+
 CALLGRAPH = defaultdict(list)
 FULLNAMES = defaultdict(set)
 
 g_max_print_depth = 15
+
+ctrl_green = '\033[032m'
+ctrl_reset = '\033[0m'
 
 def get_diag_info(diag):
     return {
@@ -121,7 +143,7 @@ def print_calls(fun_name, so_far, depth=0):
     if fun_name in CALLGRAPH:
         for f in CALLGRAPH[fun_name]:
             color_code = code_color_pretty(pretty_print(f))
-            print('\033[032m|\033[0m  ' * (depth) + '\033[032m|--\033[0m' + color_code)
+            print(f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code)
 
             if f in so_far:
                 continue
@@ -144,7 +166,7 @@ def filter_calls(fun_name1, func_name2, call_stack, so_far, depth=0):
     if fun_name1 in CALLGRAPH:
         for f in CALLGRAPH[fun_name1]:
             color_code = code_color_pretty(pretty_print(f))
-            line = '\033[032m|\033[0m  ' * (depth) + '\033[032m|--\033[0m' + color_code
+            line = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
             call_stack.append(line)
 
             if func_name2 in f.displayname:
@@ -160,6 +182,30 @@ def filter_calls(fun_name1, func_name2, call_stack, so_far, depth=0):
             else:
                 filter_calls(fully_qualified(f), func_name2, call_stack, so_far, depth+1)
             call_stack.pop()
+
+def ignore_calls(fun_name1, fun_name2, so_far, depth=0):
+    if depth > g_max_print_depth:
+        return
+    if depth >= 15:
+        print('...<too deep>...')
+        return
+
+    if fun_name1 in CALLGRAPH:
+        for f in CALLGRAPH[fun_name1]:
+            if fun_name2 in f.displayname:
+                continue
+
+            color_code = code_color_pretty(pretty_print(f))
+            line = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
+            print(line)
+
+            if f in so_far:
+                continue
+            so_far.append(f)
+            if fully_qualified_pretty(f) in CALLGRAPH:
+                ignore_calls(fully_qualified_pretty(f), fun_name2, so_far, depth + 1)
+            else:
+                ignore_calls(fully_qualified(f), fun_name2, so_far, depth + 1)
 
 
 def read_compile_commands(filename):
@@ -254,41 +300,74 @@ def print_callgraph(fun):
         print(fun)
         print_calls(fun, list())
     else:
+        match_list = []
         print('matching:')
         for f, ff in FULLNAMES.items():
             if f.startswith(fun):
                 for fff in ff:
+                    match_list.append(fff)
                     print(code_color_pretty(fff))
+        if len(match_list) > 0:
+            set_complete_list(match_list)
 
 def print_filter_callgraph(fun, target, call_stack):
     if fun in CALLGRAPH:
         print(fun)
         filter_calls(fun, target, call_stack, list())
     else:
+        match_list = []
         print('matching:')
         for f, ff in FULLNAMES.items():
             if f.startswith(fun):
                 for fff in ff:
+                    match_list.append(fff)
                     print(code_color_pretty(fff))
+        if len(match_list) > 0:
+            set_complete_list(match_list)
+
+def print_ignore_callgraph(fun, ignore):
+    if fun in CALLGRAPH:
+        print(fun)
+        ignore_calls(fun, ignore, list())
+    else:
+        match_list = []
+        print('matching:')
+        for f, ff in FULLNAMES.items():
+            if f.startswith(fun):
+                for fff in ff:
+                    match_list.append(fff)
+                    print(code_color_pretty(fff))
+        if len(match_list) > 0:
+            set_complete_list(match_list)
 
 
 def ask_and_print_callgraph():
-    while True:
-        fun = input('\033[31m>>> \033[0m')
+    try:
+        fun = input('>>> ')
         if not fun:
-            continue
+            return
 
         fun = fun.lstrip()
-
         if fun.startswith('?'):
             args = fun.split(' ', 2)
             if len(args) != 3:
                 print("invalid args")
-                continue
+                return
             target_keyword = args[1]
             start_func = args[2]
             call_stack = []
             print_filter_callgraph(start_func, target_keyword, call_stack)
+            return
+
+        if fun.startswith("!"):
+            args = fun.split(' ', 2)
+            if len(args) !=3:
+                print("invalid args")
+                return
+            ignore_keyword = args[1]
+            start_func = args[2]
+            print_ignore_callgraph(start_func, ignore_keyword)
+            return
 
         args = fun.split()
         if len(args) >= 2 and args[0].isdigit():
@@ -298,11 +377,14 @@ def ask_and_print_callgraph():
                 g_max_print_depth = max_depth
                 fun = ' '.join(args[1:])
                 print_callgraph(fun)
+                return
             else:
                 print("call depth should be in [1, 15]")
-                continue
+                return
         else:
             print_callgraph(fun)
+    except Exception as _:
+        traceback.print_exc()
 
 
 def main():
@@ -319,7 +401,8 @@ def main():
     if cfg['lookup']:
         print_callgraph(cfg['lookup'])
     if cfg['ask']:
-        ask_and_print_callgraph()
+        while True:
+            ask_and_print_callgraph()
 
 
 if __name__ == '__main__':

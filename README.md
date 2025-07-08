@@ -5,9 +5,32 @@ A Python 3 script based on clang which generates a call graph from a given C++ c
 
 
 ## Installation
+
+If you use Ubuntu or other linux operator system, install **libclang-dev(version 14)** first.
+
+```
+apt install libclang-dev
+```
+
 Clone the repository, navigate to the repository folder and install it as a Python package:
 ```
 pip install .
+```
+
+## Fast Usage Example
+
+Suppose we want to analysis CPython source code.
+
+
+```bash
+cd cpython/
+
+./configure
+
+# use bera to generate compile_commands.json
+bear -- make -j4
+
+clang-callgraph ./compile_commands.json
 ```
 
 ## Usage
