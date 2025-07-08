@@ -43,7 +43,8 @@ def set_complete_list(l):
 CALLGRAPH = defaultdict(list)
 FULLNAMES = defaultdict(set)
 
-g_max_print_depth = 15
+g_max_print_depth: int = 15
+g_print_depth: int = 15
 
 g_filter_set: set = set()
 g_ignore_set: set = set()
@@ -138,9 +139,9 @@ def code_color_pretty(code):
     return highlight_code.rstrip()
 
 def print_calls(fun_name, so_far, depth=0):
-    if depth > g_max_print_depth:
+    if depth > g_print_depth:
         return
-    if depth >= 15:
+    if depth >= g_max_print_depth:
         print('...<too deep>...')
         return
     if fun_name in CALLGRAPH:
@@ -159,10 +160,10 @@ def print_calls(fun_name, so_far, depth=0):
 # func_name1: start func
 # func_name2: target func
 # call_stack: call_stach
-def filter_calls(fun_name1, func_name2, call_stack, so_far, depth=0):
-    if depth > g_max_print_depth:
+def filter_calls(fun_name1, call_stack, so_far, depth=0):
+    if depth > g_print_depth:
         return
-    if depth >= 15:
+    if depth >= g_max_print_depth:
         print('...<too deep>...')
         return
 
@@ -172,9 +173,7 @@ def filter_calls(fun_name1, func_name2, call_stack, so_far, depth=0):
             line = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
             call_stack.append(line)
 
-            filter_set = set()
-            filter_set.add(func_name2)
-            for kw in (g_filter_set | filter_set):
+            for kw in g_filter_set:
                 if kw in f.displayname:
                     for line in call_stack:
                         print(line)
@@ -185,27 +184,24 @@ def filter_calls(fun_name1, func_name2, call_stack, so_far, depth=0):
                 continue
             so_far.append(f)
             if fully_qualified_pretty(f) in CALLGRAPH:
-                filter_calls(fully_qualified_pretty(f), func_name2, call_stack, so_far, depth+1)
+                filter_calls(fully_qualified_pretty(f), call_stack, so_far, depth+1)
             else:
-                filter_calls(fully_qualified(f), func_name2, call_stack, so_far, depth+1)
+                filter_calls(fully_qualified(f), call_stack, so_far, depth+1)
             call_stack.pop()
 
-def ignore_calls(fun_name1, fun_name2, so_far, depth=0):
-    if depth > g_max_print_depth:
+def ignore_calls(fun_name1, so_far, depth=0):
+    if depth > g_print_depth:
         return
-    if depth >= 15:
+    if depth >= g_max_print_depth:
         print('...<too deep>...')
         return
 
     if fun_name1 in CALLGRAPH:
         for f in CALLGRAPH[fun_name1]:
             hit_ignore = False
-            ignore_set = set()
-            ignore_set.add(fun_name2)
-            for kw in (g_ignore_set | ignore_set):
+            for kw in g_ignore_set:
                 if kw in f.displayname:
                     hit_ignore = True
-                    print(f"hit ignore, kw={kw}")
                     break
             if hit_ignore:
                 continue
@@ -218,9 +214,9 @@ def ignore_calls(fun_name1, fun_name2, so_far, depth=0):
                 continue
             so_far.append(f)
             if fully_qualified_pretty(f) in CALLGRAPH:
-                ignore_calls(fully_qualified_pretty(f), fun_name2, so_far, depth + 1)
+                ignore_calls(fully_qualified_pretty(f), so_far, depth + 1)
             else:
-                ignore_calls(fully_qualified(f), fun_name2, so_far, depth + 1)
+                ignore_calls(fully_qualified(f), so_far, depth + 1)
 
 
 def read_compile_commands(filename):
@@ -325,36 +321,28 @@ def print_callgraph(fun):
         if len(match_list) > 0:
             set_complete_list(match_list)
 
-def print_filter_callgraph(fun, target, call_stack):
+
+def print_filter_callgraph(fun, call_stack):
     if fun in CALLGRAPH:
         print(fun)
-        filter_calls(fun, target, call_stack, list())
-    else:
-        match_list = []
-        print('matching:')
-        for f, ff in FULLNAMES.items():
-            if f.startswith(fun):
-                for fff in ff:
-                    match_list.append(fff)
-                    print(code_color_pretty(fff))
-        if len(match_list) > 0:
-            set_complete_list(match_list)
+        filter_calls(fun, call_stack, list())
 
-def print_ignore_callgraph(fun, ignore):
+
+def print_ignore_callgraph(fun):
     if fun in CALLGRAPH:
         print(fun)
-        ignore_calls(fun, ignore, list())
-    else:
-        match_list = []
-        print('matching:')
-        for f, ff in FULLNAMES.items():
-            if f.startswith(fun):
-                for fff in ff:
-                    match_list.append(fff)
-                    print(code_color_pretty(fff))
-        if len(match_list) > 0:
-            set_complete_list(match_list)
+        ignore_calls(fun, list())
 
+usage_message = """
+Usage:
+    @ ignore keyword1 [keyword2] ...    add ignore keywords
+    @ filter keyword1 [keyword2] ...    add filter keywords
+    @ del_ig keyword1 [keyword2] ...    del ignore keywords
+    @ del_fi keyword1 [keyword2] ...    del filter keywords
+    @ depth  n                          set max print depth
+    @ show                              show query config
+    @ reset                             reset query config
+"""
 
 def ask_and_print_callgraph():
     try:
@@ -365,18 +353,22 @@ def ask_and_print_callgraph():
         fun = fun.lstrip()
         # special commmad
         if fun.startswith('@'):
+            global g_print_depth
             args = fun.split(' ')
             if len(args) <= 1:
-                print("usage: @ [ignore|filter|reset|show] keyword1 [keyword2] ...")
+                print(usage_message)
                 return
             if args[1] == 'reset':
                 g_filter_set.clear()
                 g_ignore_set.clear()
+                g_print_depth = g_max_print_depth
                 print("reset finish")
                 return
             if args[1] == 'show':
                 print(f'filter set: {g_filter_set}')
                 print(f'ignore set: {g_ignore_set}')
+                print(f'print depth: {g_print_depth}')
+                print(f'max print depth: {g_max_print_depth}')
                 return
             if args[1] == 'filter':
                 for keyword in args[2:]:
@@ -388,42 +380,38 @@ def ask_and_print_callgraph():
                     g_ignore_set.add(keyword)
                 print(f'update ignore set: {g_ignore_set}')
                 return
+            if args[1] == 'depth':
+                depth = int(args[2])
+                if depth <= 0 or depth >= g_max_print_depth:
+                    print(usage_message)
+                    return
+                g_print_depth = depth
+                return
+            if args[1] == 'del_ig':
+                for kw in args[2:]:
+                    g_ignore_set.remove(kw)
+                return
+            if args[1] == 'del_fi':
+                for kw in args[2:]:
+                    g_filter_set.remove(kw)
+                return
 
         if fun.startswith('?'):
-            args = fun.split(' ', 2)
-            if len(args) != 3:
-                print("invalid args")
-                return
-            target_keyword = args[1]
-            start_func = args[2]
+            args = fun.split(' ', 1)
+            start_func = args[1]
             call_stack = []
-            print_filter_callgraph(start_func, target_keyword, call_stack)
+            print_filter_callgraph(start_func, call_stack)
             return
 
         if fun.startswith("!"):
-            args = fun.split(' ', 2)
-            if len(args) !=3:
-                print("invalid args")
-                return
-            ignore_keyword = args[1]
-            start_func = args[2]
-            print_ignore_callgraph(start_func, ignore_keyword)
+            args = fun.split(' ', 1)
+            start_func = args[1]
+            print_ignore_callgraph(start_func)
             return
 
-        args = fun.split()
-        if len(args) >= 2 and args[0].isdigit():
-            max_depth = int(args[0])
-            if max_depth > 0 and max_depth < 100:
-                global g_max_print_depth
-                g_max_print_depth = max_depth
-                fun = ' '.join(args[1:])
-                print_callgraph(fun)
-                return
-            else:
-                print("call depth should be in [1, 15]")
-                return
-        else:
-            print_callgraph(fun)
+        # just find all function with keyword or print call graph
+        print_callgraph(fun)
+
     except Exception as _:
         traceback.print_exc()
 
