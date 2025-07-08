@@ -1,9 +1,6 @@
 # clang-callgraph
 A Python 3 script based on clang which generates a call graph from a given C++ codebase.
 
-![image](https://github.com/user-attachments/assets/3bb729dc-b61f-4685-b85b-51a60e873096)
-
-
 ## Installation
 
 If you use Ubuntu or other linux operator system, install **libclang-dev(version 14)** first.
@@ -14,8 +11,16 @@ apt install libclang-dev
 
 Clone the repository, navigate to the repository folder and install it as a Python package:
 ```
+git clone https://github.com/LiuYinCarl/clang-callgraph.git
+cd ./clang-callgraph
 pip install .
 ```
+
+## screenshot
+
+![image](https://github.com/user-attachments/assets/2a58ad53-13ee-491e-a8c6-0e0840166c41)
+![image](https://github.com/user-attachments/assets/3f9aeb64-f587-44ee-b3bc-6e914aac26da)
+![image](https://github.com/user-attachments/assets/afd39637-4af6-4a93-9efd-2615061dfdd7)
 
 ## Fast Usage Example
 
@@ -76,39 +81,6 @@ PyList_New(Py_ssize_t)
 |  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
 |  |--_Py_NewReference(PyObject *)
 |  |  |--new_reference(PyObject *)
-|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
 |--_Py_freelists_GET()
 |--PyMem_Calloc(size_t, size_t)
 |  |--calloc
@@ -122,24 +94,6 @@ update filter set: {'reference'}
 # show call graph with some filter words
 >>> ? PyList_New(Py_ssize_t)
 PyList_New(Py_ssize_t)
-|--_PyFreeList_Pop(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|--_PyFreeList_Pop(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|--_PyFreeList_Pop(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|--_PyFreeList_Pop(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|--_PyFreeList_Pop(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
-|--_PyFreeList_Pop(struct _Py_freelist *)
-|  |--_Py_NewReference(PyObject *)
-|  |  |--new_reference(PyObject *)
 |--_PyFreeList_Pop(struct _Py_freelist *)
 |  |--_Py_NewReference(PyObject *)
 |  |  |--new_reference(PyObject *)
