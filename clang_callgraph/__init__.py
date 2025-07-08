@@ -45,6 +45,9 @@ FULLNAMES = defaultdict(set)
 
 g_max_print_depth = 15
 
+g_filter_set: set = set()
+g_ignore_set: set = set()
+
 ctrl_green = '\033[032m'
 ctrl_reset = '\033[0m'
 
@@ -169,9 +172,13 @@ def filter_calls(fun_name1, func_name2, call_stack, so_far, depth=0):
             line = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
             call_stack.append(line)
 
-            if func_name2 in f.displayname:
-                for line in call_stack:
-                    print(line)
+            filter_set = set()
+            filter_set.add(func_name2)
+            for kw in (g_filter_set | filter_set):
+                if kw in f.displayname:
+                    for line in call_stack:
+                        print(line)
+                    break
 
             if f in so_far:
                 call_stack.pop()
@@ -192,7 +199,15 @@ def ignore_calls(fun_name1, fun_name2, so_far, depth=0):
 
     if fun_name1 in CALLGRAPH:
         for f in CALLGRAPH[fun_name1]:
-            if fun_name2 in f.displayname:
+            hit_ignore = False
+            ignore_set = set()
+            ignore_set.add(fun_name2)
+            for kw in (g_ignore_set | ignore_set):
+                if kw in f.displayname:
+                    hit_ignore = True
+                    print(f"hit ignore, kw={kw}")
+                    break
+            if hit_ignore:
                 continue
 
             color_code = code_color_pretty(pretty_print(f))
@@ -344,10 +359,36 @@ def print_ignore_callgraph(fun, ignore):
 def ask_and_print_callgraph():
     try:
         fun = input('>>> ')
-        if not fun:
+        if not fun or len(fun.strip()) <= 0:
             return
 
         fun = fun.lstrip()
+        # special commmad
+        if fun.startswith('@'):
+            args = fun.split(' ')
+            if len(args) <= 1:
+                print("usage: @ [ignore|filter|reset|show] keyword1 [keyword2] ...")
+                return
+            if args[1] == 'reset':
+                g_filter_set.clear()
+                g_ignore_set.clear()
+                print("reset finish")
+                return
+            if args[1] == 'show':
+                print(f'filter set: {g_filter_set}')
+                print(f'ignore set: {g_ignore_set}')
+                return
+            if args[1] == 'filter':
+                for keyword in args[2:]:
+                    g_filter_set.add(keyword)
+                print(f'update filter set: {g_filter_set}')
+                return
+            if args[1] == 'ignore':
+                for keyword in args[2:]:
+                    g_ignore_set.add(keyword)
+                print(f'update ignore set: {g_ignore_set}')
+                return
+
         if fun.startswith('?'):
             args = fun.split(' ', 2)
             if len(args) != 3:
