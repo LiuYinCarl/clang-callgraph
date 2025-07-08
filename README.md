@@ -31,6 +31,133 @@ cd cpython/
 bear -- make -j4
 
 clang-callgraph ./compile_commands.json
+
+>>> @
+Usage:
+    @ ignore keyword1 [keyword2] ...    add ignore keywords
+    @ filter keyword1 [keyword2] ...    add filter keywords
+    @ del_ig keyword1 [keyword2] ...    del ignore keywords
+    @ del_fi keyword1 [keyword2] ...    del filter keywords
+    @ depth  n                          set max print depth
+    @ show                              show query config
+    @ reset                             reset query config
+
+# do some setting
+>>> @ show
+filter set: set()
+ignore set: {'Head', 'Inter', 'Thread', 'GC', 'REF'}
+print depth: 2
+max print depth: 15
+
+# query keyword PyList
+>>> PyList
+matching:
+PyList_New(Py_ssize_t)
+PyList_Size(PyObject *)
+PyList_GetItem(PyObject *, Py_ssize_t)
+PyList_GetItemRef(PyObject *, Py_ssize_t)
+PyList_SetItem(PyObject *, Py_ssize_t, PyObject *)
+PyList_Insert(PyObject *, Py_ssize_t, PyObject *)
+PyList_Append(PyObject *, PyObject *)
+PyList_GetSlice(PyObject *, Py_ssize_t, Py_ssize_t)
+PyList_SetSlice(PyObject *, Py_ssize_t, Py_ssize_t, PyObject *)
+PyList_Sort(PyObject *)
+PyList_Reverse(PyObject *)
+PyList_AsTuple(PyObject *)
+PyList_GET_SIZE(PyObject *)
+PyList_SET_ITEM(PyObject *, Py_ssize_t, PyObject *)
+PyList_Extend(PyObject *, PyObject *)
+PyList_Clear(PyObject *)
+
+# show call graph with ignore some keywords
+>>> ! PyList_New(Py_ssize_t)
+PyList_New(Py_ssize_t)
+|--_PyFreeList_Pop(struct _Py_freelist *)
+|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|  |--_PyFreeList_PopNoStats(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|--_Py_freelists_GET()
+|--PyMem_Calloc(size_t, size_t)
+|  |--calloc
+|--PyErr_NoMemory()
+|--Py_SET_SIZE(PyVarObject *, Py_ssize_t)
+
+# add filter keyword
+>>> @ filter reference
+update filter set: {'reference'}
+
+# show call graph with some filter words
+>>> ? PyList_New(Py_ssize_t)
+PyList_New(Py_ssize_t)
+|--_PyFreeList_Pop(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|--_PyFreeList_Pop(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|--_PyFreeList_Pop(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|--_PyFreeList_Pop(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|--_PyFreeList_Pop(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|--_PyFreeList_Pop(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|--_PyFreeList_Pop(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|--_PyFreeList_Pop(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|--_PyFreeList_Pop(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|--_PyFreeList_Pop(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|--_PyFreeList_Pop(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
+|--_PyFreeList_Pop(struct _Py_freelist *)
+|  |--_Py_NewReference(PyObject *)
+|  |  |--new_reference(PyObject *)
 ```
 
 ## Usage
