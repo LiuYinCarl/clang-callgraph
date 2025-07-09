@@ -4,9 +4,13 @@ from pprint import pprint
 from clang.cindex import CursorKind, Index
 from collections import defaultdict
 import readline
+import os
 import sys
 import json
+from sched import scheduler
+import time
 import yaml
+import threading
 import traceback
 import signal
 from pygments import highlight
@@ -291,10 +295,77 @@ def keep_arg(x) -> bool:
     return keep_this
 
 
+g_index = Index.create()
+
+# k:v = file:{'mtime':xx, args:[xxx,], 'excluded_paths':[], 'excluded_prefixed':[]]}
+g_monitor_file_map = {}
+
+def add_monitor_file(file: str, data:dict):
+    if not os.path.exists(file):
+        return
+    mtime = os.path.getmtime(file)
+    data['mtime'] = mtime
+    g_monitor_file_map[file] = data
+
+def clear_file_nodes(node, modify_file):
+    file = node.extent.start.file.name
+    if file != modify_file:
+        return
+    FULLNAMES[fully_qualified(node)].clear()
+    CALLGRAPH[fully_qualified_pretty(node)].clear()
+    for c in node.get_children():
+        clear_file_nodes(c, modify_file)
+
+def monitor_file_change(file: str):
+    args: list = g_monitor_file_map[file]['args']
+    tu = g_index.parse(file, args)
+    print(f'*** update {file}')
+    if not tu:
+        print("unable to update file")
+
+    for d in tu.diagnostics:
+        if d.severity == d.Error or d.severity == d.Fatal:
+            print(' '.join(args))
+            pprint(('diags', list(map(get_diag_info, tu.diagnostics))))
+            return
+
+    clear_file_nodes(tu.cursor, file)
+
+    show_info(
+        tu.cursor,
+        g_monitor_file_map[file]['excluded_paths'],
+        g_monitor_file_map[file]['excluded_prefixes'],
+    )
+    add_monitor_file(file, g_monitor_file_map[file])
+
+g_sched = None
+
+# TODO not thread safe now.
+def background_task():
+    # print('bg task run...')
+    for file, data in g_monitor_file_map.items():
+        if not os.path.exists(file):
+            continue
+        mtime = os.path.getmtime(file)
+        if mtime > data['mtime']:
+            monitor_file_change(file)
+
+    g_sched.enter(2, 1, background_task)
+
+def sched_start():
+    global g_sched
+    g_sched = scheduler(time.time, time.sleep)
+    g_sched.enter(2, 1, background_task)
+    g_sched.run()
+
+def start_monitor():
+    bg_thread = threading.Thread(target=sched_start, daemon=True)
+    bg_thread.start()
+
+
 def analyze_source_files(cfg):
     print('reading source files...')
     for cmd in read_compile_commands(cfg['db']):
-        index = Index.create()
         # https://clang.llvm.org/docs/JSONCompilationDatabase.html#format
         # either "arguments" or "command" is required.
         if 'arguments' in cmd:
@@ -302,7 +373,7 @@ def analyze_source_files(cfg):
         else:
             arguments = cmd['command'].split()
         c = [x for x in arguments if keep_arg(x)] + cfg['clang_args']
-        tu = index.parse(cmd['file'], c)
+        tu = g_index.parse(cmd['file'], c)
         print(cmd['file'])
         if not tu:
             print("unable to load input")
@@ -313,6 +384,13 @@ def analyze_source_files(cfg):
                 pprint(('diags', list(map(get_diag_info, tu.diagnostics))))
                 return
         show_info(tu.cursor, cfg['excluded_paths'], cfg['excluded_prefixes'])
+
+        data = {
+            'args': c,
+            'excluded_paths': cfg['excluded_paths'],
+            'excluded_prefixes': cfg['excluded_prefixes']
+        }
+        add_monitor_file(cmd['file'], data)
 
 
 def print_callgraph(fun):
@@ -435,6 +513,8 @@ def main():
     load_config_file(cfg)
 
     analyze_source_files(cfg)
+
+    start_monitor()
 
     if cfg['lookup']:
         print_callgraph(cfg['lookup'])
