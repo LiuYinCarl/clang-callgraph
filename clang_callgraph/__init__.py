@@ -8,6 +8,7 @@ import sys
 import json
 import yaml
 import traceback
+import signal
 from pygments import highlight
 from pygments.lexers import CLexer
 from pygments.formatters import TerminalFormatter
@@ -23,7 +24,15 @@ prompted to type in the function's name for which you wan to obtain the
 callgraph
 """
 
-## readline
+# signal
+
+def signal_handler(sig, frame):
+    print("user exit.")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+
 # readline helper
 
 complete_list = []
