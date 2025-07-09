@@ -24,6 +24,21 @@ prompted to type in the function's name for which you wan to obtain the
 callgraph
 """
 
+CALLGRAPH = defaultdict(list)
+FULLNAMES = defaultdict(set)
+
+g_max_print_depth: int = 15
+g_print_depth: int = 15
+
+g_filter_set: set = set()
+g_ignore_set: set = set()
+g_buffer = []
+
+ctrl_green = '\033[032m'
+ctrl_red   = '\033[031m'
+ctrl_reset = '\033[0m'
+
+
 # signal
 
 def signal_handler(sig, frame):
@@ -49,17 +64,24 @@ def set_complete_list(l):
     complete_list = l
 
 
-CALLGRAPH = defaultdict(list)
-FULLNAMES = defaultdict(set)
+# buffer
 
-g_max_print_depth: int = 15
-g_print_depth: int = 15
 
-g_filter_set: set = set()
-g_ignore_set: set = set()
 
-ctrl_green = '\033[032m'
-ctrl_reset = '\033[0m'
+def buffer_append(msg:str):
+    g_buffer.append(msg)
+
+def buffer_flush(need_len_info=False):
+    if need_len_info:
+        msg = f"{ctrl_green}[total lines: {len(g_buffer)}]{ctrl_reset}"
+        buffer_append(msg)
+    for line in g_buffer:
+        print(line)
+    g_buffer.clear()
+
+def buffer_clear():
+    g_buffer.clear()
+
 
 def get_diag_info(diag):
     return {
@@ -151,12 +173,12 @@ def print_calls(fun_name, so_far, depth=0):
     if depth > g_print_depth:
         return
     if depth >= g_max_print_depth:
-        print('...<too deep>...')
+        buffer_append('...<too deep>...')
         return
     if fun_name in CALLGRAPH:
         for f in CALLGRAPH[fun_name]:
             color_code = code_color_pretty(pretty_print(f))
-            print(f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code)
+            buffer_append(f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code)
 
             if f in so_far:
                 continue
@@ -173,7 +195,7 @@ def filter_calls(fun_name1, call_stack, so_far, depth=0):
     if depth > g_print_depth:
         return
     if depth >= g_max_print_depth:
-        print('...<too deep>...')
+        buffer_append('...<too deep>...')
         return
 
     if fun_name1 in CALLGRAPH:
@@ -185,7 +207,7 @@ def filter_calls(fun_name1, call_stack, so_far, depth=0):
             for kw in g_filter_set:
                 if kw in f.displayname:
                     for line in call_stack:
-                        print(line)
+                        buffer_append(line)
                     break
 
             if f in so_far:
@@ -202,7 +224,7 @@ def ignore_calls(fun_name1, so_far, depth=0):
     if depth > g_print_depth:
         return
     if depth >= g_max_print_depth:
-        print('...<too deep>...')
+        buffer_append('...<too deep>...')
         return
 
     if fun_name1 in CALLGRAPH:
@@ -217,7 +239,7 @@ def ignore_calls(fun_name1, so_far, depth=0):
 
             color_code = code_color_pretty(pretty_print(f))
             line = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
-            print(line)
+            buffer_append(line)
 
             if f in so_far:
                 continue
@@ -316,8 +338,9 @@ def analyze_source_files(cfg):
 
 
 def print_callgraph(fun):
+    print('')
     if fun in CALLGRAPH:
-        print(fun)
+        buffer_append(fun)
         print_calls(fun, list())
     else:
         match_list = []
@@ -326,21 +349,26 @@ def print_callgraph(fun):
             if f.startswith(fun):
                 for fff in ff:
                     match_list.append(fff)
-                    print(code_color_pretty(fff))
+                    buffer_append(code_color_pretty(fff))
         if len(match_list) > 0:
             set_complete_list(match_list)
+    buffer_flush(True)
 
 
 def print_filter_callgraph(fun, call_stack):
+    print('')
     if fun in CALLGRAPH:
-        print(fun)
+        buffer_append(fun)
         filter_calls(fun, call_stack, list())
+    buffer_flush(True)
 
 
 def print_ignore_callgraph(fun):
+    print('')
     if fun in CALLGRAPH:
-        print(fun)
+        buffer_append(fun)
         ignore_calls(fun, list())
+    buffer_flush(True)
 
 usage_message = """
 Usage:
@@ -422,6 +450,7 @@ def ask_and_print_callgraph():
         print_callgraph(fun)
 
     except Exception as _:
+        buffer_clear()
         traceback.print_exc()
 
 
