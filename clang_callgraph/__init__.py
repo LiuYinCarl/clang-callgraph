@@ -172,7 +172,7 @@ def code_color_pretty(code):
     return highlight_code.rstrip()
 
 def print_refs(fun_name, so_far, depth=0):
-    if depth > g_print_depth:
+    if depth >= g_print_depth:
         return
     if depth >= g_max_print_depth:
         buffer_append('...<too deep>...')
@@ -188,7 +188,7 @@ def print_refs(fun_name, so_far, depth=0):
                 print_refs(f, so_far, depth+1)
 
 def print_calls(fun_name, so_far, depth=0):
-    if depth > g_print_depth:
+    if depth >= g_print_depth:
         return
     if depth >= g_max_print_depth:
         buffer_append('...<too deep>...')
@@ -210,7 +210,7 @@ def print_calls(fun_name, so_far, depth=0):
 # func_name2: target func
 # call_stack: call_stach
 def filter_calls(fun_name1, call_stack, so_far, depth=0):
-    if depth > g_print_depth:
+    if depth >= g_print_depth:
         return
     if depth >= g_max_print_depth:
         buffer_append('...<too deep>...')
@@ -239,7 +239,7 @@ def filter_calls(fun_name1, call_stack, so_far, depth=0):
             call_stack.pop()
 
 def ignore_calls(fun_name1, so_far, depth=0):
-    if depth > g_print_depth:
+    if depth >= g_print_depth:
         return
     if depth >= g_max_print_depth:
         buffer_append('...<too deep>...')
