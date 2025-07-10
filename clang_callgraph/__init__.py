@@ -26,6 +26,7 @@ callgraph
 
 CALLGRAPH = defaultdict(list)
 FULLNAMES = defaultdict(set)
+REFGRAPH  = defaultdict(list) # after_main: [main, exit, ...]
 
 g_max_print_depth: int = 15
 g_print_depth: int = 15
@@ -150,6 +151,7 @@ def show_info(node, xfiles, xprefs, cur_fun=None):
 
     if node.kind == CursorKind.CALL_EXPR:
         if node.referenced and not is_excluded(node.referenced, xfiles, xprefs):
+            REFGRAPH[fully_qualified_pretty(node.referenced)].append(fully_qualified_pretty(cur_fun))
             CALLGRAPH[fully_qualified_pretty(cur_fun)].append(node.referenced)
 
     for c in node.get_children():
@@ -168,6 +170,22 @@ def code_color_pretty(code):
     formatter = TerminalFormatter()
     highlight_code = highlight(code, CLexer(), formatter)
     return highlight_code.rstrip()
+
+def print_refs(fun_name, so_far, depth=0):
+    if depth > g_print_depth:
+        return
+    if depth >= g_max_print_depth:
+        buffer_append('...<too deep>...')
+        return
+    if fun_name in REFGRAPH:
+        for f in REFGRAPH[fun_name]:
+            color_code = code_color_pretty(f)
+            buffer_append(f'{ctrl_red}|{ctrl_reset}  ' * depth + f'{ctrl_red}|--{ctrl_reset}' + color_code)
+            if f in so_far:
+                continue
+            so_far.append(f)
+            if f in REFGRAPH:
+                print_refs(f, so_far, depth+1)
 
 def print_calls(fun_name, so_far, depth=0):
     if depth > g_print_depth:
@@ -336,6 +354,12 @@ def analyze_source_files(cfg):
                 return
         show_info(tu.cursor, cfg['excluded_paths'], cfg['excluded_prefixes'])
 
+def print_refgraph(fun):
+    print('')
+    if fun in REFGRAPH:
+        buffer_append(fun)
+        print_refs(fun, list())
+    buffer_flush(True)
 
 def print_callgraph(fun):
     print('')
@@ -379,6 +403,9 @@ Usage:
     @ depth  n                          set max print depth
     @ show                              show query config
     @ reset                             reset query config
+    ? complete_function_name            show call graph to function contain 'filter' keywords
+    ! complete_function_name            show call graph without 'ignore' keywords
+    & complete_function_name            show reference of function
 """
 
 def ask_and_print_callgraph():
@@ -444,6 +471,12 @@ def ask_and_print_callgraph():
             args = fun.split(' ', 1)
             start_func = args[1]
             print_ignore_callgraph(start_func)
+            return
+
+        if fun.startswith("&"):
+            args = fun.split(' ', 1)
+            start_func = args[1]
+            print_refgraph(start_func)
             return
 
         # just find all function with keyword or print call graph
