@@ -35,6 +35,7 @@ g_filter_set: set = set()
 g_ignore_set: set = set()
 g_buffer = []
 
+ctrl_yellow= '\033[033m'
 ctrl_green = '\033[032m'
 ctrl_red   = '\033[031m'
 ctrl_reset = '\033[0m'
@@ -342,7 +343,13 @@ def analyze_source_files(cfg):
         else:
             arguments = cmd['command'].split()
         c = [x for x in arguments if keep_arg(x)] + cfg['clang_args']
-        tu = index.parse(cmd['file'], c)
+        tu = None
+        try:
+            tu = index.parse(cmd['file'], c)
+        except Exception as _:
+            print(f"failed parse file: {cmd['file']}")
+            traceback.print_exc()
+
         print(cmd['file'])
         if not tu:
             print("unable to load input")
@@ -364,11 +371,11 @@ def print_refgraph(fun):
 def print_callgraph(fun):
     print('')
     if fun in CALLGRAPH:
-        buffer_append(fun)
+        buffer_append(code_color_pretty(fun))
         print_calls(fun, list())
     else:
         match_list = []
-        print('matching:')
+        print(f'{ctrl_yellow}matching list:{ctrl_reset}')
         for f, ff in FULLNAMES.items():
             if f.startswith(fun):
                 for fff in ff:
@@ -382,7 +389,7 @@ def print_callgraph(fun):
 def print_filter_callgraph(fun, call_stack):
     print('')
     if fun in CALLGRAPH:
-        buffer_append(fun)
+        buffer_append(code_color_pretty(fun))
         filter_calls(fun, call_stack, list())
     buffer_flush(True)
 
@@ -390,7 +397,7 @@ def print_filter_callgraph(fun, call_stack):
 def print_ignore_callgraph(fun):
     print('')
     if fun in CALLGRAPH:
-        buffer_append(fun)
+        buffer_append(code_color_pretty(fun))
         ignore_calls(fun, list())
     buffer_flush(True)
 
@@ -410,11 +417,11 @@ Usage:
 
 def ask_and_print_callgraph():
     try:
-        fun = input('>>> ')
+        fun = input(f'>>> ')
         if not fun or len(fun.strip()) <= 0:
             return
 
-        fun = fun.lstrip()
+        fun = fun.strip()
         # special commmad
         if fun.startswith('@'):
             global g_print_depth
