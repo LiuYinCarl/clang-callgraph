@@ -152,8 +152,11 @@ def show_info(node, xfiles, xprefs, cur_fun=None):
 
     if node.kind == CursorKind.CALL_EXPR:
         if node.referenced and not is_excluded(node.referenced, xfiles, xprefs):
-            REFGRAPH[fully_qualified_pretty(node.referenced)].append(fully_qualified_pretty(cur_fun))
-            CALLGRAPH[fully_qualified_pretty(cur_fun)].append(node.referenced)
+            ref_pretty = fully_qualified_pretty(node.referenced)
+            cur_pretty = fully_qualified_pretty(cur_fun)
+            if cur_pretty not in REFGRAPH[ref_pretty]:
+                REFGRAPH[ref_pretty].append(cur_pretty)
+            CALLGRAPH[cur_pretty].append(node.referenced)
 
     for c in node.get_children():
         show_info(c, xfiles, xprefs, cur_fun)
