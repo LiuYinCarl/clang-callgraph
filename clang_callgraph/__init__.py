@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from pprint import pprint
-from clang.cindex import CursorKind, Index
+from clang.cindex import CursorKind, Index, Config
 from collections import defaultdict
 import readline
 import sys
@@ -287,6 +287,7 @@ def read_args(args):
     excluded_paths = []
     config_filename = None
     lookup = None
+    library_path = None
     i = 0
     while i < len(args):
         if args[i] == '-x':
@@ -301,6 +302,9 @@ def read_args(args):
         elif args[i] == '--lookup':
             i += 1
             lookup = args[i]
+        elif args[i] == '--library_path':
+            i += 1
+            library_path = args[i]
         elif args[i][0] == '-':
             clang_args.append(args[i])
         else:
@@ -317,7 +321,8 @@ def read_args(args):
         'excluded_paths': excluded_paths,
         'config_filename': config_filename,
         'lookup': lookup,
-        'ask': (lookup is None)
+        'ask': (lookup is None),
+        'library_path': library_path
     }
 
 
@@ -325,7 +330,7 @@ def load_config_file(cfg):
     if cfg['config_filename']:
         with open(cfg['config_filename'], 'r') as yamlfile:
             data = yaml.load(yamlfile, Loader=yaml.FullLoader)
-            keys = ('clang_args', 'excluded_prefixes', 'excluded_paths')
+            keys = ('clang_args', 'excluded_prefixes', 'excluded_paths', 'library_path')
             for k in keys:
                 cfg[k] += data.get(k, [])
 
@@ -337,6 +342,9 @@ def keep_arg(x) -> bool:
 
 def analyze_source_files(cfg):
     print('reading source files...')
+    if cfg['library_path']:
+        Config.set_library_path(cfg['library_path'])
+
     for cmd in read_compile_commands(cfg['db']):
         index = Index.create()
         # https://clang.llvm.org/docs/JSONCompilationDatabase.html#format
@@ -498,12 +506,12 @@ def ask_and_print_callgraph():
 
 
 def main():
-    if len(sys.argv) < 2:
+    cfg = read_args(sys.argv[1:])
+    if cfg['db'] is None:
         print('usage: ' + sys.argv[0] + ' file.cpp|compile_database.json '
               '[extra clang args...]')
         return
 
-    cfg = read_args(sys.argv)
     load_config_file(cfg)
 
     analyze_source_files(cfg)
