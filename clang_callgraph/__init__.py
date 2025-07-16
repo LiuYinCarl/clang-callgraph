@@ -3,6 +3,7 @@
 from pprint import pprint
 from clang.cindex import CursorKind, Index, Config
 from collections import defaultdict
+import os
 import readline
 import sys
 import json
@@ -272,6 +273,15 @@ def ignore_calls(fun_name1, so_far, depth=0):
                 ignore_calls(fully_qualified(f), so_far, depth + 1)
 
 
+def check_libclang_exists(directory):
+    """ Find if libclang-14.so exists in directory.
+    """
+    if not os.path.exists(directory):
+        return False
+
+    lib_path = os.path.join(directory, "libclang-14.so")
+    return os.path.isfile(lib_path)
+
 def read_compile_commands(filename):
     if filename.endswith('.json'):
         with open(filename) as compdb:
@@ -343,7 +353,10 @@ def keep_arg(x) -> bool:
 def analyze_source_files(cfg):
     print('reading source files...')
     if cfg['library_path']:
-        Config.set_library_path(cfg['library_path'])
+        if check_libclang_exists(cfg['library_path']):
+            Config.set_library_path(cfg['library_path'])
+        else:
+            print(f"{ctrl_red}cannot find libclang-14.so in {cfg['library_path']}, ignore library_path argument.{ctrl_reset}")
 
     for cmd in read_compile_commands(cfg['db']):
         index = Index.create()
