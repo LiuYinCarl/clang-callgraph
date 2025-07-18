@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
 
-from pprint import pprint
-from clang.cindex import CursorKind, Index, Config
-from collections import defaultdict
 import os
 import readline
 import sys
@@ -10,9 +7,13 @@ import json
 import yaml
 import traceback
 import signal
+from pprint import pprint
+from clang.cindex import CursorKind, Index, Config, TranslationUnit
+from collections import defaultdict
 from pygments import highlight
 from pygments.lexers import CLexer
 from pygments.formatters import TerminalFormatter
+
 
 """
 Dumps a callgraph of a function in a codebase
@@ -34,17 +35,17 @@ g_print_depth: int = 15
 
 g_filter_set: set = set()
 g_ignore_set: set = set()
-g_buffer = []
+g_buffer: list = []
 
-ctrl_yellow= '\033[033m'
-ctrl_green = '\033[032m'
-ctrl_red   = '\033[031m'
-ctrl_reset = '\033[0m'
+ctrl_yellow: str = '\033[033m'
+ctrl_green : str = '\033[032m'
+ctrl_red   : str = '\033[031m'
+ctrl_reset : str = '\033[0m'
 
 
 # signal
 
-def signal_handler(sig, frame):
+def signal_handler(sig, frame) -> None:
     print("user exit.")
     sys.exit(0)
 
@@ -53,34 +54,34 @@ signal.signal(signal.SIGINT, signal_handler)
 
 # readline helper
 
-complete_list = []
+complete_list: list[str] = []
 
-def complete(text, state):
-    options = [c for c in complete_list if c.startswith(text)]
+def complete(text: str, state: int) -> str|None:
+    options: list = [c for c in complete_list if c.startswith(text)]
     return options[state] if state < len(options) else None
 
 readline.parse_and_bind("tab: complete")
 readline.set_completer(complete)
 
-def set_complete_list(l):
+def set_complete_list(l: list[str]):
     global complete_list
     complete_list = l
 
 
 # buffer
 
-
-
-def buffer_append(msg:str):
+def buffer_append(msg: str):
     g_buffer.append(msg)
 
-def buffer_flush(need_len_info=False):
+
+def buffer_flush(need_len_info: bool=False):
     if need_len_info:
-        msg = f"{ctrl_green}[total lines: {len(g_buffer)}]{ctrl_reset}"
+        msg: str = f"{ctrl_green}[total lines: {len(g_buffer)}]{ctrl_reset}"
         buffer_append(msg)
     for line in g_buffer:
         print(line)
     g_buffer.clear()
+
 
 def buffer_clear():
     g_buffer.clear()
@@ -96,7 +97,7 @@ def get_diag_info(diag):
     }
 
 
-def fully_qualified(c):
+def fully_qualified(c) -> str:
     if c is None:
         return ''
     elif c.kind == CursorKind.TRANSLATION_UNIT:
@@ -108,7 +109,7 @@ def fully_qualified(c):
         return c.spelling
 
 
-def fully_qualified_pretty(c):
+def fully_qualified_pretty(c) -> str:
     if c is None:
         return ''
     elif c.kind == CursorKind.TRANSLATION_UNIT:
@@ -120,7 +121,7 @@ def fully_qualified_pretty(c):
         return c.displayname
 
 
-def is_excluded(node, xfiles, xprefs):
+def is_excluded(node, xfiles, xprefs) -> bool:
     if not node.extent.start.file:
         return False
 
@@ -128,7 +129,7 @@ def is_excluded(node, xfiles, xprefs):
         if node.extent.start.file.name.startswith(xf):
             return True
 
-    fqp = fully_qualified_pretty(node)
+    fqp: str = fully_qualified_pretty(node)
 
     for xp in xprefs:
         if fqp.startswith(xp):
@@ -137,7 +138,7 @@ def is_excluded(node, xfiles, xprefs):
     return False
 
 
-def show_info(node, xfiles, xprefs, cur_fun=None):
+def show_info(node, xfiles, xprefs, cur_fun=None) -> None:
     if node.kind == CursorKind.FUNCTION_TEMPLATE:
         if not is_excluded(node, xfiles, xprefs):
             cur_fun = node
@@ -163,7 +164,7 @@ def show_info(node, xfiles, xprefs, cur_fun=None):
         show_info(c, xfiles, xprefs, cur_fun)
 
 
-def pretty_print(n):
+def pretty_print(n) -> str:
     v = ''
     if n.is_virtual_method():
         v = ' virtual'
@@ -171,12 +172,14 @@ def pretty_print(n):
         v = ' = 0'
     return fully_qualified_pretty(n) + v
 
-def code_color_pretty(code):
-    formatter = TerminalFormatter()
+
+def code_color_pretty(code: str) -> str:
+    formatter: TerminalFormatter = TerminalFormatter()
     highlight_code = highlight(code, CLexer(), formatter)
     return highlight_code.rstrip()
 
-def print_refs(fun_name, so_far, depth=0):
+
+def print_refs(fun_name: str, so_far: list, depth: int=0) -> None:
     if depth >= g_print_depth:
         return
     if depth >= g_max_print_depth:
@@ -192,7 +195,7 @@ def print_refs(fun_name, so_far, depth=0):
             if f in REFGRAPH:
                 print_refs(f, so_far, depth+1)
 
-def print_calls(fun_name, so_far, depth=0):
+def print_calls(fun_name: str, so_far: list, depth: int=0) -> None:
     if depth >= g_print_depth:
         return
     if depth >= g_max_print_depth:
@@ -211,20 +214,18 @@ def print_calls(fun_name, so_far, depth=0):
             else:
                 print_calls(fully_qualified(f), so_far, depth + 1)
 
-# func_name1: start func
-# func_name2: target func
-# call_stack: call_stach
-def filter_calls(fun_name1, call_stack, so_far, depth=0):
+
+def filter_calls(func_name: str, call_stack: list, so_far: list, depth: int=0) -> None:
     if depth >= g_print_depth:
         return
     if depth >= g_max_print_depth:
         buffer_append('...<too deep>...')
         return
 
-    if fun_name1 in CALLGRAPH:
-        for f in CALLGRAPH[fun_name1]:
-            color_code = code_color_pretty(pretty_print(f))
-            line = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
+    if func_name in CALLGRAPH:
+        for f in CALLGRAPH[func_name]:
+            color_code: str = code_color_pretty(pretty_print(f))
+            line: str = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
             call_stack.append(line)
 
             for kw in g_filter_set:
@@ -243,16 +244,17 @@ def filter_calls(fun_name1, call_stack, so_far, depth=0):
                 filter_calls(fully_qualified(f), call_stack, so_far, depth+1)
             call_stack.pop()
 
-def ignore_calls(fun_name1, so_far, depth=0):
+
+def ignore_calls(func_name: str, so_far: list, depth: int=0) -> None:
     if depth >= g_print_depth:
         return
     if depth >= g_max_print_depth:
         buffer_append('...<too deep>...')
         return
 
-    if fun_name1 in CALLGRAPH:
-        for f in CALLGRAPH[fun_name1]:
-            hit_ignore = False
+    if func_name in CALLGRAPH:
+        for f in CALLGRAPH[func_name]:
+            hit_ignore: bool = False
             for kw in g_ignore_set:
                 if kw in f.displayname:
                     hit_ignore = True
@@ -260,8 +262,8 @@ def ignore_calls(fun_name1, so_far, depth=0):
             if hit_ignore:
                 continue
 
-            color_code = code_color_pretty(pretty_print(f))
-            line = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
+            color_code: str = code_color_pretty(pretty_print(f))
+            line: str = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
             buffer_append(line)
 
             if f in so_far:
@@ -273,16 +275,17 @@ def ignore_calls(fun_name1, so_far, depth=0):
                 ignore_calls(fully_qualified(f), so_far, depth + 1)
 
 
-def check_libclang_exists(directory):
+def check_libclang_exists(directory: str) -> bool:
     """ Find if libclang-14.so exists in directory.
     """
     if not os.path.exists(directory):
         return False
 
-    lib_path = os.path.join(directory, "libclang-14.so")
+    lib_path: str = os.path.join(directory, "libclang-14.so")
     return os.path.isfile(lib_path)
 
-def read_compile_commands(filename):
+
+def read_compile_commands(filename: str) -> list:
     if filename.endswith('.json'):
         with open(filename) as compdb:
             return json.load(compdb)
@@ -290,15 +293,15 @@ def read_compile_commands(filename):
         return [{'command': '', 'file': filename}]
 
 
-def read_args(args):
+def read_args(args: list) -> dict:
     db = None
-    clang_args = []
-    excluded_prefixes = []
-    excluded_paths = []
-    config_filename = None
-    lookup = None
-    library_path = None
-    i = 0
+    clang_args: list = []
+    excluded_prefixes: list = []
+    excluded_paths: list = []
+    config_filename: str = ""
+    lookup: str = ""
+    library_path: str = ""
+    i: int = 0
     while i < len(args):
         if args[i] == '-x':
             i += 1
@@ -331,12 +334,12 @@ def read_args(args):
         'excluded_paths': excluded_paths,
         'config_filename': config_filename,
         'lookup': lookup,
-        'ask': (lookup is None),
+        'ask': (not lookup),
         'library_path': library_path
     }
 
 
-def load_config_file(cfg):
+def load_config_file(cfg: dict) -> None:
     if cfg['config_filename']:
         with open(cfg['config_filename'], 'r') as yamlfile:
             data = yaml.load(yamlfile, Loader=yaml.FullLoader)
@@ -345,12 +348,11 @@ def load_config_file(cfg):
                 cfg[k] += data.get(k, [])
 
 
-def keep_arg(x) -> bool:
-    keep_this = x.startswith('-I') or x.startswith('-std=') or x.startswith('-D')
-    return keep_this
+def keep_arg(x: str) -> bool:
+    return x.startswith('-I') or x.startswith('-std=') or x.startswith('-D')
 
 
-def analyze_source_files(cfg):
+def analyze_source_files(cfg: dict) -> None:
     print('reading source files...')
     if cfg['library_path']:
         if check_libclang_exists(cfg['library_path']):
@@ -359,7 +361,7 @@ def analyze_source_files(cfg):
             print(f"{ctrl_red}cannot find libclang-14.so in {cfg['library_path']}, ignore library_path argument.{ctrl_reset}")
 
     for cmd in read_compile_commands(cfg['db']):
-        index = Index.create()
+        index: Index = Index.create()
         # https://clang.llvm.org/docs/JSONCompilationDatabase.html#format
         # either "arguments" or "command" is required.
         if 'arguments' in cmd:
@@ -367,38 +369,37 @@ def analyze_source_files(cfg):
         else:
             arguments = cmd['command'].split()
         c = [x for x in arguments if keep_arg(x)] + cfg['clang_args']
-        tu = None
+
         try:
-            tu = index.parse(cmd['file'], c)
+            tu: TranslationUnit = index.parse(cmd['file'], c)
+            print(cmd['file'])
+
+            for d in tu.diagnostics:
+                if d.severity == d.Error or d.severity == d.Fatal:
+                    print(' '.join(c))
+                    pprint(('diags', list(map(get_diag_info, tu.diagnostics))))
+                    return
+            show_info(tu.cursor, cfg['excluded_paths'], cfg['excluded_prefixes'])
         except Exception as _:
             print(f"failed parse file: {cmd['file']}")
             traceback.print_exc()
 
-        print(cmd['file'])
-        if not tu:
-            print("unable to load input")
 
-        for d in tu.diagnostics:
-            if d.severity == d.Error or d.severity == d.Fatal:
-                print(' '.join(c))
-                pprint(('diags', list(map(get_diag_info, tu.diagnostics))))
-                return
-        show_info(tu.cursor, cfg['excluded_paths'], cfg['excluded_prefixes'])
-
-def print_refgraph(fun):
+def print_refgraph(fun: str) -> None:
     print('')
     if fun in REFGRAPH:
         buffer_append(fun)
         print_refs(fun, list())
     buffer_flush(True)
 
-def print_callgraph(fun):
+
+def print_callgraph(fun: str) -> None:
     print('')
     if fun in CALLGRAPH:
         buffer_append(code_color_pretty(fun))
         print_calls(fun, list())
     else:
-        match_list = []
+        match_list: list = []
         print(f'{ctrl_yellow}matching list:{ctrl_reset}')
         for f, ff in FULLNAMES.items():
             if f.startswith(fun):
@@ -410,7 +411,7 @@ def print_callgraph(fun):
     buffer_flush(True)
 
 
-def print_filter_callgraph(fun, call_stack):
+def print_filter_callgraph(fun: str, call_stack: list) -> None:
     print('')
     if fun in CALLGRAPH:
         buffer_append(code_color_pretty(fun))
@@ -418,14 +419,15 @@ def print_filter_callgraph(fun, call_stack):
     buffer_flush(True)
 
 
-def print_ignore_callgraph(fun):
+def print_ignore_callgraph(fun: str) -> None:
     print('')
     if fun in CALLGRAPH:
         buffer_append(code_color_pretty(fun))
         ignore_calls(fun, list())
     buffer_flush(True)
 
-usage_message = """
+
+usage_message: str = """
 Usage:
     @ ignore keyword1 [keyword2] ...    add ignore keywords
     @ filter keyword1 [keyword2] ...    add filter keywords
@@ -439,9 +441,9 @@ Usage:
     & complete_function_name            show reference of function
 """
 
-def ask_and_print_callgraph():
+def ask_and_print_callgraph() -> None:
     try:
-        fun = input(f'>>> ')
+        fun: str = input(f'>>> ')
         if not fun or len(fun.strip()) <= 0:
             return
 
@@ -449,9 +451,9 @@ def ask_and_print_callgraph():
         # special commmad
         if fun.startswith('@'):
             global g_print_depth
-            args = fun.split(' ')
+            args: list[str] = fun.split(' ')
             if len(args) <= 1:
-                print(usage_message)
+                print(f'{ctrl_green}{usage_message}{ctrl_reset}')
                 return
             if args[1] == 'reset':
                 g_filter_set.clear()
@@ -460,23 +462,23 @@ def ask_and_print_callgraph():
                 print("reset finish")
                 return
             if args[1] == 'show':
-                print(f'filter set: {g_filter_set}')
-                print(f'ignore set: {g_ignore_set}')
-                print(f'print depth: {g_print_depth}')
-                print(f'max print depth: {g_max_print_depth}')
+                print(f'{ctrl_green}filter set: {g_filter_set}{ctrl_reset}')
+                print(f'{ctrl_green}ignore set: {g_ignore_set}{ctrl_reset}')
+                print(f'{ctrl_green}print depth: {g_print_depth}{ctrl_reset}')
+                print(f'{ctrl_green}max print depth: {g_max_print_depth}{ctrl_reset}')
                 return
             if args[1] == 'filter':
                 for keyword in args[2:]:
                     g_filter_set.add(keyword)
-                print(f'update filter set: {g_filter_set}')
+                print(f'update filter set:{ctrl_green} {g_filter_set}{ctrl_reset}')
                 return
             if args[1] == 'ignore':
                 for keyword in args[2:]:
                     g_ignore_set.add(keyword)
-                print(f'update ignore set: {g_ignore_set}')
+                print(f'update ignore set:{ctrl_green} {g_ignore_set}{ctrl_reset}')
                 return
             if args[1] == 'depth':
-                depth = int(args[2])
+                depth: int = int(args[2])
                 if depth <= 0 or depth >= g_max_print_depth:
                     print(usage_message)
                     return
@@ -493,20 +495,20 @@ def ask_and_print_callgraph():
 
         if fun.startswith('?'):
             args = fun.split(' ', 1)
-            start_func = args[1]
-            call_stack = []
+            start_func: str = args[1]
+            call_stack: list = []
             print_filter_callgraph(start_func, call_stack)
             return
 
         if fun.startswith("!"):
             args = fun.split(' ', 1)
-            start_func = args[1]
+            start_func: str = args[1]
             print_ignore_callgraph(start_func)
             return
 
         if fun.startswith("&"):
             args = fun.split(' ', 1)
-            start_func = args[1]
+            start_func: str = args[1]
             print_refgraph(start_func)
             return
 
@@ -518,8 +520,8 @@ def ask_and_print_callgraph():
         traceback.print_exc()
 
 
-def main():
-    cfg = read_args(sys.argv[1:])
+def main() -> None:
+    cfg: dict = read_args(sys.argv[1:])
     if cfg['db'] is None:
         print('usage: ' + sys.argv[0] + ' file.cpp|compile_database.json '
               '[extra clang args...]')
