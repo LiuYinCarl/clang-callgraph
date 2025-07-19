@@ -378,7 +378,7 @@ def analyze_source_files(cfg: dict) -> None:
                 if d.severity == d.Error or d.severity == d.Fatal:
                     print(' '.join(c))
                     pprint(('diags', list(map(get_diag_info, tu.diagnostics))))
-                    return
+                    # return
             show_info(tu.cursor, cfg['excluded_paths'], cfg['excluded_prefixes'])
         except Exception as _:
             print(f"failed parse file: {cmd['file']}")
