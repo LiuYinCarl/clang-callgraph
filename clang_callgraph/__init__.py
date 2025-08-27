@@ -327,6 +327,10 @@ def read_args(args: list) -> dict:
     if len(excluded_paths) == 0:
         excluded_paths.append('/usr')
 
+    # try to use compile_commands.json as default db
+    if not db and os.path.exists('compile_commands.json'):
+        db = 'compile_commands.json'
+
     return {
         'db': db,
         'clang_args': clang_args,
