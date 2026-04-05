@@ -131,6 +131,46 @@ Understood `options` are:
 
 For more details look at the [example](#Example) provided.
 
+## Performance and Cache
+To improve startup time on large projects such as CPython, `clang-callgraph` now uses:
+
+* multi-process parsing via `-j N` / `--jobs N`
+* on-disk per-translation-unit cache
+* quiet mode by default during loading, so it does not print every parsed file
+
+After loading finishes, the tool prints a short summary like:
+
+```
+loaded 355 files, 18803 functions in 0.64s with 1 workers
+```
+
+The summary contains:
+* number of loaded compilation database entries
+* number of discovered functions
+* total load time
+* number of workers actually used for parsing in this run
+
+### Cache location
+Cache files are stored in:
+
+```
+~/.cache/clang-callgraph/
+```
+
+Each cache entry is keyed from:
+* source file path
+* source file size and modification time
+* compilation directory
+* filtered clang arguments
+* excluded path/prefix settings
+
+If those inputs stay unchanged, later runs can reuse cached results and become much faster.
+
+### Notes
+* quiet mode is the default behavior now; detailed per-file diagnostics are hidden unless the code is changed to print them again.
+* if all files are served from cache, the summary may show `1 workers`, because no real parallel parsing work was needed in that run.
+* first load of a very large codebase is still slower than warm-cache reloads because libclang must parse every translation unit at least once.
+
 ## Configuration File
 A configuration file can be used for options that don't depend on the source project to be analysed.
 This way it makes command lines shorter.
