@@ -7,6 +7,10 @@ import json
 import yaml
 import traceback
 import signal
+import hashlib
+import shutil
+import time
+from pathlib import Path
 from pprint import pprint
 from clang.cindex import CursorKind, Index, Config, TranslationUnit
 from collections import defaultdict
@@ -29,6 +33,9 @@ callgraph
 CALLGRAPH = defaultdict(list)
 FULLNAMES = defaultdict(set)
 REFGRAPH  = defaultdict(list) # after_main: [main, exit, ...]
+CALLSITE_SEEN = defaultdict(set)
+CACHE_VERSION = 2
+LAST_LOAD_STATS: dict = {}
 
 g_max_print_depth: int = 15
 g_print_depth: int = 15
@@ -36,6 +43,10 @@ g_print_depth: int = 15
 g_filter_set: set = set()
 g_ignore_set: set = set()
 g_buffer: list = []
+
+g_progress_tty: bool = sys.stderr.isatty()
+g_progress_active: bool = False
+g_progress_last_update: float = 0.0
 
 ctrl_yellow: str = '\033[033m'
 ctrl_green : str = '\033[032m'
@@ -87,14 +98,30 @@ def buffer_clear():
     g_buffer.clear()
 
 
-def get_diag_info(diag):
-    return {
-        'severity': diag.severity,
-        'location': diag.location,
-        'spelling': diag.spelling,
-        'ranges': list(diag.ranges),
-        'fixits': list(diag.fixits)
-    }
+def progress_update(msg: str, force: bool=False) -> None:
+    global g_progress_active
+    global g_progress_last_update
+    if not g_progress_tty:
+        return
+    now = time.perf_counter()
+    if not force and now - g_progress_last_update < 0.2:
+        return
+    width = max(20, shutil.get_terminal_size(fallback=(120, 20)).columns - 1)
+    line = msg[:width]
+    sys.stderr.write(f'\r\x1b[2K{line}')
+    sys.stderr.flush()
+    g_progress_active = True
+    g_progress_last_update = now
+
+
+def progress_finish() -> None:
+    global g_progress_active
+    if not g_progress_tty:
+        return
+    if g_progress_active:
+        sys.stderr.write('\r\x1b[2K\n')
+        sys.stderr.flush()
+        g_progress_active = False
 
 
 def fully_qualified(c) -> str:
@@ -156,15 +183,39 @@ def show_info(node, xfiles, xprefs, cur_fun=None) -> None:
         if node.referenced and not is_excluded(node.referenced, xfiles, xprefs):
             ref_pretty = fully_qualified_pretty(node.referenced)
             cur_pretty = fully_qualified_pretty(cur_fun)
-            if cur_pretty not in REFGRAPH[ref_pretty]:
-                REFGRAPH[ref_pretty].append(cur_pretty)
-            CALLGRAPH[cur_pretty].append(node.referenced)
+            location = node.location
+            loc_key = (
+                location.file.name if location.file else '',
+                location.line,
+                location.column,
+                ref_pretty,
+            )
+            if os.environ.get('CLANG_CALLGRAPH_DEBUG_CALLS') == cur_pretty:
+                semantic_parent = fully_qualified_pretty(node.semantic_parent) if node.semantic_parent else ''
+                lexical_parent = fully_qualified_pretty(node.lexical_parent) if node.lexical_parent else ''
+                sys.stderr.write(
+                    "debug call: "
+                    f"caller={cur_pretty} callee={ref_pretty} loc={loc_key} "
+                    f"semantic_parent={semantic_parent} lexical_parent={lexical_parent}\n"
+                )
+                sys.stderr.flush()
+            if loc_key not in CALLSITE_SEEN[cur_pretty]:
+                CALLSITE_SEEN[cur_pretty].add(loc_key)
+                if cur_pretty not in REFGRAPH[ref_pretty]:
+                    REFGRAPH[ref_pretty].append(cur_pretty)
+                CALLGRAPH[cur_pretty].append(node.referenced)
+            elif os.environ.get('CLANG_CALLGRAPH_DEBUG_CALLS') == cur_pretty:
+                sys.stderr.write(f"debug duplicate-suppressed: caller={cur_pretty} callee={ref_pretty} loc={loc_key}\n")
+                sys.stderr.flush()
 
     for c in node.get_children():
         show_info(c, xfiles, xprefs, cur_fun)
 
 
 def pretty_print(n) -> str:
+    if isinstance(n, dict):
+        return pretty_print_cached(n)
+
     v = ''
     if n.is_virtual_method():
         v = ' virtual'
@@ -206,12 +257,13 @@ def print_calls(fun_name: str, so_far: list, depth: int=0) -> None:
             color_code = code_color_pretty(pretty_print(f))
             buffer_append(f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code)
 
-            if f in so_far:
+            node_key = cursor_key(f)
+            if node_key in so_far:
                 continue
-            so_far.append(f)
-            if fully_qualified_pretty(f) in CALLGRAPH:
-                print_calls(fully_qualified_pretty(f), so_far, depth + 1)
-            else:
+            so_far.append(node_key)
+            if node_key in CALLGRAPH:
+                print_calls(node_key, so_far, depth + 1)
+            elif not isinstance(f, dict):
                 print_calls(fully_qualified(f), so_far, depth + 1)
 
 
@@ -228,19 +280,21 @@ def filter_calls(func_name: str, call_stack: list, so_far: list, depth: int=0) -
             line: str = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
             call_stack.append(line)
 
+            displayname = f['displayname'] if isinstance(f, dict) else f.displayname
             for kw in g_filter_set:
-                if kw in f.displayname:
+                if kw in displayname:
                     for line in call_stack:
                         buffer_append(line)
                     break
 
-            if f in so_far:
+            node_key = cursor_key(f)
+            if node_key in so_far:
                 call_stack.pop()
                 continue
-            so_far.append(f)
-            if fully_qualified_pretty(f) in CALLGRAPH:
-                filter_calls(fully_qualified_pretty(f), call_stack, so_far, depth+1)
-            else:
+            so_far.append(node_key)
+            if node_key in CALLGRAPH:
+                filter_calls(node_key, call_stack, so_far, depth+1)
+            elif not isinstance(f, dict):
                 filter_calls(fully_qualified(f), call_stack, so_far, depth+1)
             call_stack.pop()
 
@@ -255,8 +309,9 @@ def ignore_calls(func_name: str, so_far: list, depth: int=0) -> None:
     if func_name in CALLGRAPH:
         for f in CALLGRAPH[func_name]:
             hit_ignore: bool = False
+            displayname = f['displayname'] if isinstance(f, dict) else f.displayname
             for kw in g_ignore_set:
-                if kw in f.displayname:
+                if kw in displayname:
                     hit_ignore = True
                     break
             if hit_ignore:
@@ -266,12 +321,13 @@ def ignore_calls(func_name: str, so_far: list, depth: int=0) -> None:
             line: str = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
             buffer_append(line)
 
-            if f in so_far:
+            node_key = cursor_key(f)
+            if node_key in so_far:
                 continue
-            so_far.append(f)
-            if fully_qualified_pretty(f) in CALLGRAPH:
-                ignore_calls(fully_qualified_pretty(f), so_far, depth + 1)
-            else:
+            so_far.append(node_key)
+            if node_key in CALLGRAPH:
+                ignore_calls(node_key, so_far, depth + 1)
+            elif not isinstance(f, dict):
                 ignore_calls(fully_qualified(f), so_far, depth + 1)
 
 
@@ -293,6 +349,92 @@ def read_compile_commands(filename: str) -> list:
         return [{'command': '', 'file': filename}]
 
 
+def serialize_cursor(node) -> dict:
+    return {
+        'spelling': node.spelling,
+        'displayname': node.displayname,
+        'is_virtual_method': node.is_virtual_method(),
+        'is_pure_virtual_method': node.is_pure_virtual_method(),
+    }
+
+
+def cursor_key(node) -> str:
+    if isinstance(node, dict):
+        return node['displayname'] if node['displayname'] else node['spelling']
+    return fully_qualified_pretty(node)
+
+
+def pretty_print_cached(node: dict) -> str:
+    v = ''
+    if node['is_virtual_method']:
+        v = ' virtual'
+    if node['is_pure_virtual_method']:
+        v = ' = 0'
+    return cursor_key(node) + v
+
+
+def get_cache_path(cfg: dict) -> Path:
+    db_path: str = os.path.abspath(cfg['db'])
+    stat = os.stat(db_path)
+    payload = {
+        'db': db_path,
+        'mtime_ns': stat.st_mtime_ns,
+        'size': stat.st_size,
+        'clang_args': cfg['clang_args'],
+        'excluded_prefixes': cfg['excluded_prefixes'],
+        'excluded_paths': cfg['excluded_paths'],
+        'library_path': cfg['library_path'],
+        'cache_version': CACHE_VERSION,
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
+    cache_dir = Path(db_path).parent / '.clang-callgraph-cache'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f'{digest}.json'
+
+
+def save_cache(cache_path: Path) -> None:
+    data = {
+        'callgraph': dict(CALLGRAPH),
+        'fullnames': {k: sorted(v) for k, v in FULLNAMES.items()},
+        'refgraph': dict(REFGRAPH),
+        'stats': LAST_LOAD_STATS,
+    }
+    cache_path.write_text(json.dumps(data, sort_keys=True), encoding='utf-8')
+
+
+def load_cache(cache_path: Path) -> bool:
+    if not cache_path.exists():
+        return False
+    data = json.loads(cache_path.read_text(encoding='utf-8'))
+
+    CALLGRAPH.clear()
+    for key, values in data['callgraph'].items():
+        CALLGRAPH[key].extend(values)
+
+    FULLNAMES.clear()
+    for key, values in data['fullnames'].items():
+        FULLNAMES[key].update(values)
+
+    REFGRAPH.clear()
+    for key, values in data['refgraph'].items():
+        REFGRAPH[key].extend(values)
+
+    LAST_LOAD_STATS.clear()
+    LAST_LOAD_STATS.update(data.get('stats', {}))
+    return True
+
+
+def clear_cache_dir(cfg: dict) -> int:
+    cache_dir = get_cache_path(cfg).parent
+    if not cache_dir.exists():
+        return 0
+    removed = 0
+    for path in cache_dir.glob('*.json'):
+        path.unlink()
+        removed += 1
+    return removed
+
+
 def read_args(args: list) -> dict:
     db = None
     clang_args: list = []
@@ -301,6 +443,7 @@ def read_args(args: list) -> dict:
     config_filename: str = ""
     lookup: str = ""
     library_path: str = ""
+    clear_cache: bool = False
     i: int = 0
     while i < len(args):
         if args[i] == '-x':
@@ -318,6 +461,8 @@ def read_args(args: list) -> dict:
         elif args[i] == '--library_path':
             i += 1
             library_path = args[i]
+        elif args[i] == '--clear-cache':
+            clear_cache = True
         elif args[i][0] == '-':
             clang_args.append(args[i])
         else:
@@ -339,7 +484,8 @@ def read_args(args: list) -> dict:
         'config_filename': config_filename,
         'lookup': lookup,
         'ask': (not lookup),
-        'library_path': library_path
+        'library_path': library_path,
+        'clear_cache': clear_cache
     }
 
 
@@ -357,6 +503,19 @@ def keep_arg(x: str) -> bool:
 
 
 def analyze_source_files(cfg: dict) -> None:
+    start_time: float = time.perf_counter()
+    cache_path: Path = get_cache_path(cfg)
+    compile_commands = read_compile_commands(cfg['db'])
+    if load_cache(cache_path):
+        LAST_LOAD_STATS.update({
+            'files_loaded': len(compile_commands),
+            'load_seconds': round(time.perf_counter() - start_time, 3),
+            'used_cache': True,
+            'functions_loaded': len(FULLNAMES),
+            'edges_loaded': sum(len(v) for v in CALLGRAPH.values()),
+        })
+        return
+
     print('reading source files...')
     if cfg['library_path']:
         if check_libclang_exists(cfg['library_path']):
@@ -364,8 +523,14 @@ def analyze_source_files(cfg: dict) -> None:
         else:
             print(f"{ctrl_red}cannot find libclang-14.so in {cfg['library_path']}, ignore library_path argument.{ctrl_reset}")
 
-    for cmd in read_compile_commands(cfg['db']):
-        index: Index = Index.create()
+    CALLGRAPH.clear()
+    FULLNAMES.clear()
+    REFGRAPH.clear()
+    CALLSITE_SEEN.clear()
+
+    index: Index = Index.create()
+    total_commands = len(compile_commands)
+    for idx, cmd in enumerate(compile_commands, start=1):
         # https://clang.llvm.org/docs/JSONCompilationDatabase.html#format
         # either "arguments" or "command" is required.
         if 'arguments' in cmd:
@@ -376,17 +541,36 @@ def analyze_source_files(cfg: dict) -> None:
 
         try:
             tu: TranslationUnit = index.parse(cmd['file'], c)
-            print(cmd['file'])
+            progress_update(
+                f"loading {idx}/{total_commands} files, functions={len(FULLNAMES)}: {cmd['file']}",
+                force=(idx == 1 or idx == total_commands),
+            )
 
             for d in tu.diagnostics:
                 if d.severity == d.Error or d.severity == d.Fatal:
-                    print(' '.join(c))
-                    pprint(('diags', list(map(get_diag_info, tu.diagnostics))))
-                    # return
+                    break
             show_info(tu.cursor, cfg['excluded_paths'], cfg['excluded_prefixes'])
         except Exception as _:
             print(f"failed parse file: {cmd['file']}")
             traceback.print_exc()
+
+    serializable_callgraph = defaultdict(list)
+    for key, values in CALLGRAPH.items():
+        serializable_callgraph[key].extend(serialize_cursor(value) for value in values)
+    CALLGRAPH.clear()
+    for key, values in serializable_callgraph.items():
+        CALLGRAPH[key].extend(values)
+
+    progress_finish()
+    LAST_LOAD_STATS.clear()
+    LAST_LOAD_STATS.update({
+        'files_loaded': len(compile_commands),
+        'functions_loaded': len(FULLNAMES),
+        'edges_loaded': sum(len(v) for v in CALLGRAPH.values()),
+        'used_cache': False,
+        'load_seconds': round(time.perf_counter() - start_time, 3),
+    })
+    save_cache(cache_path)
 
 
 def print_refgraph(fun: str) -> None:
@@ -533,7 +717,21 @@ def main() -> None:
 
     load_config_file(cfg)
 
+    if cfg['clear_cache']:
+        removed = clear_cache_dir(cfg)
+        print(f'cleared cache files: {removed}')
+        return
+
     analyze_source_files(cfg)
+    if LAST_LOAD_STATS:
+        print(
+            'load summary: '
+            f"files={LAST_LOAD_STATS.get('files_loaded', 0)}, "
+            f"functions={LAST_LOAD_STATS.get('functions_loaded', 0)}, "
+            f"edges={LAST_LOAD_STATS.get('edges_loaded', 0)}, "
+            f"seconds={LAST_LOAD_STATS.get('load_seconds', 0)}, "
+            f"cache={'yes' if LAST_LOAD_STATS.get('used_cache') else 'no'}"
+        )
 
     if cfg['lookup']:
         print_callgraph(cfg['lookup'])
