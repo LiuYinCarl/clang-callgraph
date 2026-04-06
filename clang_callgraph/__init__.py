@@ -5,7 +5,6 @@ import json
 import os
 import readline
 import shlex
-import shutil
 import signal
 import sys
 import time
@@ -100,22 +99,6 @@ def buffer_flush(need_len_info: bool=False):
 
 def buffer_clear():
     g_buffer.clear()
-
-
-def clear_cache() -> int:
-    if not CACHE_DIR.exists():
-        return 0
-
-    count = 0
-    for cache_file in CACHE_DIR.glob('*.json'):
-        if cache_file.is_file():
-            cache_file.unlink()
-            count += 1
-
-    for child in CACHE_DIR.iterdir():
-        if child.is_dir():
-            shutil.rmtree(child)
-    return count
 
 
 def get_diag_info(diag):
@@ -243,14 +226,7 @@ def show_info(node, xfiles, xprefs, cur_fun=None) -> None:
             ref_pretty = fully_qualified_pretty(referenced)
             cur_pretty = fully_qualified_pretty(cur_fun)
             append_refgraph_value(REFGRAPH, ref_pretty, cur_pretty)
-            qualified_name = fully_qualified(referenced)
-            match_name = referenced.displayname or qualified_name or ref_pretty
-            CALLGRAPH[cur_pretty].append({
-                'pretty': pretty_print(referenced),
-                'match_name': match_name,
-                'qualified_name': qualified_name,
-                'next': ref_pretty,
-            })
+            CALLGRAPH[cur_pretty].append(pretty_print(referenced))
 
     for c in node.get_children():
         show_info(c, xfiles, xprefs, cur_fun)
@@ -295,17 +271,14 @@ def print_calls(fun_name: str, so_far: list, depth: int=0) -> None:
         return
     if fun_name in CALLGRAPH:
         for f in CALLGRAPH[fun_name]:
-            color_code = code_color_pretty(f['pretty'])
+            color_code = code_color_pretty(f)
             buffer_append(f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code)
 
-            next_fun = f['next']
-            fallback_fun = f.get('qualified_name', next_fun)
-            recurse_key = next_fun if next_fun in CALLGRAPH else fallback_fun
-            if recurse_key in so_far:
+            if f in so_far:
                 continue
-            so_far.append(recurse_key)
-            if recurse_key in CALLGRAPH:
-                print_calls(recurse_key, so_far, depth + 1)
+            so_far.append(f)
+            if f in CALLGRAPH:
+                print_calls(f, so_far, depth + 1)
 
 
 def filter_calls(func_name: str, call_stack: list, so_far: list, depth: int=0) -> None:
@@ -317,25 +290,22 @@ def filter_calls(func_name: str, call_stack: list, so_far: list, depth: int=0) -
 
     if func_name in CALLGRAPH:
         for f in CALLGRAPH[func_name]:
-            color_code: str = code_color_pretty(f['pretty'])
+            color_code: str = code_color_pretty(f)
             line: str = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
             call_stack.append(line)
 
             for kw in g_filter_set:
-                if kw in f.get('match_name', '') or kw in f.get('qualified_name', '') or kw in f['pretty']:
+                if kw in f:
                     for line in call_stack:
                         buffer_append(line)
                     break
 
-            next_fun = f['next']
-            fallback_fun = f.get('qualified_name', next_fun)
-            recurse_key = next_fun if next_fun in CALLGRAPH else fallback_fun
-            if recurse_key in so_far:
+            if f in so_far:
                 call_stack.pop()
                 continue
-            so_far.append(recurse_key)
-            if recurse_key in CALLGRAPH:
-                filter_calls(recurse_key, call_stack, so_far, depth+1)
+            so_far.append(f)
+            if f in CALLGRAPH:
+                filter_calls(f, call_stack, so_far, depth+1)
             call_stack.pop()
 
 
@@ -350,24 +320,21 @@ def ignore_calls(func_name: str, so_far: list, depth: int=0) -> None:
         for f in CALLGRAPH[func_name]:
             hit_ignore: bool = False
             for kw in g_ignore_set:
-                if kw in f.get('match_name', '') or kw in f.get('qualified_name', '') or kw in f['pretty']:
+                if kw in f:
                     hit_ignore = True
                     break
             if hit_ignore:
                 continue
 
-            color_code: str = code_color_pretty(f['pretty'])
+            color_code: str = code_color_pretty(f)
             line: str = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
             buffer_append(line)
 
-            next_fun = f['next']
-            fallback_fun = f.get('qualified_name', next_fun)
-            recurse_key = next_fun if next_fun in CALLGRAPH else fallback_fun
-            if recurse_key in so_far:
+            if f in so_far:
                 continue
-            so_far.append(recurse_key)
-            if recurse_key in CALLGRAPH:
-                ignore_calls(recurse_key, so_far, depth + 1)
+            so_far.append(f)
+            if f in CALLGRAPH:
+                ignore_calls(f, so_far, depth + 1)
 
 
 def check_libclang_exists(directory: str) -> bool:
@@ -381,13 +348,6 @@ def check_libclang_exists(directory: str) -> bool:
 
 
 def read_compile_commands(filename: str) -> list:
-    if os.path.isdir(filename):
-        compdb_path = os.path.join(filename, 'compile_commands.json')
-        if os.path.exists(compdb_path):
-            filename = compdb_path
-        else:
-            raise FileNotFoundError(f'compile_commands.json not found in directory: {filename}')
-
     if filename.endswith('.json'):
         with open(filename) as compdb:
             return json.load(compdb)
@@ -405,7 +365,6 @@ def read_args(args: list) -> dict:
     library_path: str = ""
     jobs: int = max(1, min(16, (os.cpu_count() or 1)))
     quiet: bool = True
-    clear_cache_first: bool = False
     i: int = 0
     while i < len(args):
         if args[i] == '-x':
@@ -428,10 +387,6 @@ def read_args(args: list) -> dict:
             jobs = max(1, int(args[i]))
         elif args[i] == '--quiet':
             quiet = True
-        elif args[i] == '--verbose':
-            quiet = False
-        elif args[i] == '--clear-cache':
-            clear_cache_first = True
         elif args[i][0] == '-':
             clang_args.append(args[i])
         else:
@@ -456,7 +411,6 @@ def read_args(args: list) -> dict:
         'library_path': library_path,
         'jobs': jobs,
         'quiet': quiet,
-        'clear_cache_first': clear_cache_first,
     }
 
 
@@ -473,7 +427,7 @@ def keep_arg(x: str) -> bool:
     return x.startswith('-I') or x.startswith('-std=') or x.startswith('-D')
 
 
-def normalize_compile_command(cmd: dict, extra_clang_args: list[str], db_fingerprint: str='') -> dict:
+def normalize_compile_command(cmd: dict, extra_clang_args: list[str]) -> dict:
     file_path = cmd['file']
     directory = cmd.get('directory', '')
     if 'arguments' in cmd:
@@ -482,13 +436,10 @@ def normalize_compile_command(cmd: dict, extra_clang_args: list[str], db_fingerp
         arguments = shlex.split(cmd['command'])
 
     clang_args = [x for x in arguments if keep_arg(x)] + extra_clang_args
-    raw_command = json.dumps(cmd, sort_keys=True, separators=(',', ':'))
     return {
         'file': file_path,
         'directory': directory,
         'clang_args': clang_args,
-        'command_fingerprint': hashlib.sha256(raw_command.encode()).hexdigest(),
-        'db_fingerprint': db_fingerprint,
     }
 
 
@@ -509,41 +460,17 @@ def normalize_graph_lists(result: dict) -> dict:
     return result
 
 
-def file_signature(file_path: str) -> dict:
-    stat = os.stat(file_path)
-    return {
-        'path': file_path,
-        'mtime_ns': stat.st_mtime_ns,
-        'size': stat.st_size,
-    }
-
-
-def read_db_fingerprint(db_path: str) -> str:
-    if not db_path.endswith('.json'):
-        return ''
-    stat = os.stat(db_path)
-    payload = {
-        'path': db_path,
-        'mtime_ns': stat.st_mtime_ns,
-        'size': stat.st_size,
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'))
-    return hashlib.sha256(encoded.encode()).hexdigest()
-
-
-def dependency_signatures_from_result(result: dict) -> list[dict]:
-    return result.get('dependencies', [])
-
-
 def cache_key_for_task(task: dict) -> str:
+    file_path = task['file']
+    stat = os.stat(file_path)
     payload = {
-        'file': file_signature(task['file']),
+        'file': file_path,
+        'mtime_ns': stat.st_mtime_ns,
+        'size': stat.st_size,
         'directory': task['directory'],
         'clang_args': task['clang_args'],
         'excluded_paths': task['excluded_paths'],
         'excluded_prefixes': task['excluded_prefixes'],
-        'command_fingerprint': task.get('command_fingerprint', ''),
-        'db_fingerprint': task.get('db_fingerprint', ''),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(encoded.encode()).hexdigest()
@@ -559,18 +486,9 @@ def load_cached_result(task: dict) -> dict | None:
         return None
     try:
         with cache_path.open() as cache_file:
-            cached = json.load(cache_file)
+            return json.load(cache_file)
     except Exception:
         return None
-
-    try:
-        for dependency in dependency_signatures_from_result(cached):
-            if file_signature(dependency['path']) != dependency:
-                return None
-    except Exception:
-        return None
-
-    return cached
 
 
 def save_cached_result(task: dict, result: dict) -> None:
@@ -617,14 +535,7 @@ def parse_translation_unit(task: dict) -> dict:
                     if referenced and not is_excluded(referenced, xfiles, xprefs):
                         ref_pretty = fully_qualified_pretty(referenced)
                         append_partial_ref(ref_pretty, current_pretty)
-                        qualified_name = fully_qualified(referenced)
-                        match_name = referenced.displayname or qualified_name or ref_pretty
-                        partial_callgraph[current_pretty].append({
-                            'pretty': pretty_print(referenced),
-                            'match_name': match_name,
-                            'qualified_name': qualified_name,
-                            'next': ref_pretty,
-                        })
+                        partial_callgraph[current_pretty].append(pretty_print(referenced))
                 elif child_kind == CursorKind.FUNCTION_TEMPLATE or child_kind == CursorKind.CXX_METHOD or child_kind == CursorKind.FUNCTION_DECL:
                     continue
                 stack.append(child)
@@ -646,18 +557,6 @@ def parse_translation_unit(task: dict) -> dict:
         for d in tu.diagnostics:
             if d.severity == d.Error or d.severity == d.Fatal:
                 diagnostics.append(get_diag_info(d))
-        dependencies = []
-        seen_dependency_paths = set()
-        for include in tu.get_includes():
-            include_file = include.include
-            if include_file is None:
-                continue
-            dependency_path = include_file.name
-            if dependency_path in seen_dependency_paths:
-                continue
-            seen_dependency_paths.add(dependency_path)
-            if os.path.exists(dependency_path):
-                dependencies.append(file_signature(dependency_path))
         walk_root(tu.cursor)
         return normalize_graph_lists({
             'file': file_path,
@@ -665,7 +564,6 @@ def parse_translation_unit(task: dict) -> dict:
             'fullnames': dict(partial_fullnames),
             'refgraph': dict(partial_refgraph),
             'diagnostics': diagnostics,
-            'dependencies': dependencies,
             'error': None,
         })
     except Exception:
@@ -684,11 +582,6 @@ def parse_translation_unit(task: dict) -> dict:
 
 def analyze_source_files(cfg: dict) -> dict:
     start_time = time.perf_counter()
-    CALLGRAPH.clear()
-    FULLNAMES.clear()
-    REFGRAPH.clear()
-    buffer_clear()
-    set_complete_list([])
     if cfg['library_path']:
         if check_libclang_exists(cfg['library_path']):
             Config.set_library_path(cfg['library_path'])
@@ -696,26 +589,25 @@ def analyze_source_files(cfg: dict) -> dict:
             print(f"{ctrl_red}cannot find libclang-14.so in {cfg['library_path']}, ignore library_path argument.{ctrl_reset}")
 
     compile_commands = read_compile_commands(cfg['db'])
-    db_fingerprint = read_db_fingerprint(cfg['db'])
+    tasks = []
     results = []
     pending_tasks = []
     for cmd in compile_commands:
-        normalized = normalize_compile_command(cmd, cfg['clang_args'], db_fingerprint)
+        normalized = normalize_compile_command(cmd, cfg['clang_args'])
         normalized['excluded_paths'] = cfg['excluded_paths']
         normalized['excluded_prefixes'] = cfg['excluded_prefixes']
         cached = load_cached_result(normalized)
         if cached is not None:
             results.append(cached)
         else:
+            tasks.append(normalized)
             pending_tasks.append(normalized)
 
-    actual_workers = 1
     if pending_tasks:
-        actual_workers = 1 if cfg['jobs'] <= 1 else min(cfg['jobs'], len(pending_tasks))
-        if actual_workers == 1:
+        if cfg['jobs'] <= 1 or len(pending_tasks) <= 1:
             fresh_results = [parse_translation_unit(task) for task in pending_tasks]
         else:
-            with ProcessPoolExecutor(max_workers=actual_workers) as executor:
+            with ProcessPoolExecutor(max_workers=cfg['jobs']) as executor:
                 fresh_results = list(executor.map(parse_translation_unit, pending_tasks, chunksize=4))
         for task, result in zip(pending_tasks, fresh_results):
             if result['error'] is None:
@@ -727,7 +619,7 @@ def analyze_source_files(cfg: dict) -> dict:
     summary = {
         'file_count': len(results),
         'function_count': len(FULLNAMES),
-        'jobs': actual_workers,
+        'jobs': cfg['jobs'] if len(pending_tasks) > 1 else 1,
         'load_seconds': time.perf_counter() - start_time,
     }
 
@@ -888,10 +780,6 @@ def main() -> None:
         return
 
     load_config_file(cfg)
-
-    if cfg['clear_cache_first']:
-        cleared = clear_cache()
-        print(f"cleared {cleared} cache files")
 
     summary = analyze_source_files(cfg)
     print(f"loaded {summary['file_count']} files, {summary['function_count']} functions in {summary['load_seconds']:.2f}s with {summary['jobs']} workers")

@@ -167,10 +167,9 @@ Each cache entry is keyed from:
 If those inputs stay unchanged, later runs can reuse cached results and become much faster.
 
 ### Notes
-* quiet mode is the default behavior now; detailed per-file diagnostics are hidden unless you pass `--verbose`.
+* quiet mode is the default behavior now; detailed per-file diagnostics are hidden unless the code is changed to print them again.
 * if all files are served from cache, the summary may show `1 workers`, because no real parallel parsing work was needed in that run.
 * first load of a very large codebase is still slower than warm-cache reloads because libclang must parse every translation unit at least once.
-* use `--clear-cache` to delete cached JSON entries in `~/.cache/clang-callgraph/` before loading.
 
 ## Configuration File
 A configuration file can be used for options that don't depend on the source project to be analysed.
