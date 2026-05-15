@@ -1,621 +1,674 @@
 #!/usr/bin/env python3
+"""Generate an interactive call graph from C/C++ codebases using libclang."""
 
-import os
-import readline
-import sys
-import json
-import yaml
-import traceback
-import signal
+import atexit
+import bisect
 import hashlib
+import json
+import os
+import pickle
 import shutil
+import signal
+import sys
 import time
-from pathlib import Path
-from pprint import pprint
-from clang.cindex import CursorKind, Index, Config, TranslationUnit
+import traceback
 from collections import defaultdict
+from pprint import pprint
+
+from clang.cindex import Config, CursorKind, Index, TranslationUnit
 from pygments import highlight
-from pygments.lexers import CLexer
 from pygments.formatters import TerminalFormatter
+from pygments.lexers import CLexer
+
+try:
+    import readline
+except ImportError:
+    try:
+        import pyreadline3 as readline
+    except ImportError:
+        readline = None
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 
-"""
-Dumps a callgraph of a function in a codebase
-usage: callgraph.py file.cpp|compile_commands.json [-x exclude-list] [extra clang args...]
-The easiest way to generate the file compile_commands.json for any make based
-compilation chain is to use Bear and recompile with `bear make`.
+# ── constants ────────────────────────────────────────────────────────────────
 
-When running the python script, after parsing all the codebase, you are
-prompted to type in the function's name for which you wan to obtain the
-callgraph
-"""
+C_YELLOW = '\033[033m'
+C_GREEN  = '\033[032m'
+C_RED    = '\033[031m'
+C_RESET  = '\033[0m'
 
-CALLGRAPH = defaultdict(list)
-FULLNAMES = defaultdict(set)
-REFGRAPH  = defaultdict(list) # after_main: [main, exit, ...]
-CALLSITE_SEEN = defaultdict(set)
-CACHE_VERSION = 2
-LAST_LOAD_STATS: dict = {}
+HISTORY_FILE = os.path.expanduser('~/.clang_callgraph_history')
+HISTORY_LEN  = 1000
+MAX_DEPTH    = 15
 
-g_max_print_depth: int = 15
-g_print_depth: int = 15
+# pygments singletons
+_FORMATTER = TerminalFormatter()
+_CLEXER    = CLexer()
 
-g_filter_set: set = set()
-g_ignore_set: set = set()
-g_buffer: list = []
-
-g_progress_tty: bool = sys.stderr.isatty()
-g_progress_active: bool = False
-g_progress_last_update: float = 0.0
-
-ctrl_yellow: str = '\033[033m'
-ctrl_green : str = '\033[032m'
-ctrl_red   : str = '\033[031m'
-ctrl_reset : str = '\033[0m'
+# libclang cursor kinds that introduce a function
+_FUNC_KINDS = {CursorKind.FUNCTION_DECL, CursorKind.CXX_METHOD,
+               CursorKind.FUNCTION_TEMPLATE}
 
 
-# signal
+# ── data model ───────────────────────────────────────────────────────────────
 
-def signal_handler(sig, frame) -> None:
-    print("user exit.")
-    sys.exit(0)
+CALLGRAPH = defaultdict(list)       # caller_display_name → [CallTarget, …]
+REFGRAPH  = defaultdict(list)       # callee_display_name → [caller_display_name, …]
+FULLNAMES = defaultdict(set)        # spelling_fq  → {display_name, …}
 
-signal.signal(signal.SIGINT, signal_handler)
+g_depth      = MAX_DEPTH
+g_filter_set = set()
+g_ignore_set = set()
+g_buffer     = []
 
-
-# readline helper
-
-complete_list: list[str] = []
-
-def complete(text: str, state: int) -> str|None:
-    options: list = [c for c in complete_list if c.startswith(text)]
-    return options[state] if state < len(options) else None
-
-readline.parse_and_bind("tab: complete")
-readline.set_completer(complete)
-
-def set_complete_list(l: list[str]):
-    global complete_list
-    complete_list = l
+# progress bar state
+_PROGRESS_TTY   = sys.stderr.isatty()
+_PROGRESS_ACTIVE = False
+_PROGRESS_LAST   = 0.0
 
 
-# buffer
+class CallTarget:
+    """Serializable value-object replacing a libclang Cursor in the call graph.
 
-def buffer_append(msg: str):
-    g_buffer.append(msg)
+    Captures the subset of cursor fields needed for traversal and display.
+    Implements ``__eq__`` / ``__hash__`` on *fq_pretty* so deduplication
+    and cycle detection work correctly (raw Cursors are not hashable).
+    """
+    __slots__ = ('displayname', 'virtual', 'pure_virtual', 'fq_pretty', 'fq')
+
+    def __init__(self, cursor) -> None:
+        self.displayname  = cursor.displayname
+        self.virtual      = cursor.is_virtual_method()
+        self.pure_virtual = cursor.is_pure_virtual_method()
+        self.fq_pretty    = _fq_name(cursor, 'displayname')
+        self.fq           = _fq_name(cursor, 'spelling')
+
+    def __eq__(self, other):
+        if isinstance(other, CallTarget):
+            return self.fq_pretty == other.fq_pretty
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(self.fq_pretty)
+
+    def display(self) -> str:
+        """Pretty-print form used in tree output."""
+        s = self.fq_pretty
+        if self.virtual:
+            s += ' virtual'
+        if self.pure_virtual:
+            s += ' = 0'
+        return s
 
 
-def buffer_flush(need_len_info: bool=False):
-    if need_len_info:
-        msg: str = f"{ctrl_green}[total lines: {len(g_buffer)}]{ctrl_reset}"
-        buffer_append(msg)
+# ── progress bar ─────────────────────────────────────────────────────────────
+
+def _progress(msg: str, force: bool = False) -> None:
+    global _PROGRESS_ACTIVE, _PROGRESS_LAST
+    if not _PROGRESS_TTY:
+        return
+    now = time.monotonic()
+    if not force and now - _PROGRESS_LAST < 0.2:
+        return
+    width = max(20, shutil.get_terminal_size(fallback=(120, 20)).columns - 1)
+    sys.stderr.write(f'\r\x1b[2K{msg[:width]}')
+    sys.stderr.flush()
+    _PROGRESS_ACTIVE = True
+    _PROGRESS_LAST = now
+
+
+def _progress_finish() -> None:
+    global _PROGRESS_ACTIVE
+    if _PROGRESS_TTY and _PROGRESS_ACTIVE:
+        sys.stderr.write('\r\x1b[2K\n')
+        sys.stderr.flush()
+        _PROGRESS_ACTIVE = False
+
+
+# ── cursor helpers ───────────────────────────────────────────────────────────
+
+def _fq_name(cursor, attr: str) -> str:
+    if cursor is None:
+        return ''
+    if cursor.kind == CursorKind.TRANSLATION_UNIT:
+        return ''
+    parent = _fq_name(cursor.semantic_parent, attr)
+    leaf   = getattr(cursor, attr)
+    return f'{parent}::{leaf}' if parent else leaf
+
+
+def fully_qualified(c) -> str:
+    return _fq_name(c, 'spelling')
+
+
+def fully_qualified_pretty(c) -> str:
+    return _fq_name(c, 'displayname')
+
+
+def is_excluded(node, xfiles, xprefs) -> bool:
+    if node.extent is None or not node.extent.start.file:
+        return False
+    fname = node.extent.start.file.name
+    for xf in xfiles:
+        if fname.startswith(xf):
+            return True
+    fqp = fully_qualified_pretty(node)
+    for xp in xprefs:
+        if fqp.startswith(xp):
+            return True
+    return False
+
+
+def _color(code: str) -> str:
+    return highlight(code, _CLEXER, _FORMATTER).rstrip()
+
+
+# ── AST traversal ────────────────────────────────────────────────────────────
+
+def show_info(node, xfiles, xprefs, cur_fun=None) -> None:
+    if node.kind in _FUNC_KINDS:
+        if not is_excluded(node, xfiles, xprefs):
+            cur_fun = node
+            FULLNAMES[fully_qualified(cur_fun)].add(fully_qualified_pretty(cur_fun))
+
+    if node.kind == CursorKind.CALL_EXPR:
+        if cur_fun is not None and node.referenced \
+                and not is_excluded(node.referenced, xfiles, xprefs):
+            callee_pretty = fully_qualified_pretty(node.referenced)
+            caller_pretty = fully_qualified_pretty(cur_fun)
+            if caller_pretty not in REFGRAPH[callee_pretty]:
+                REFGRAPH[callee_pretty].append(caller_pretty)
+            CALLGRAPH[caller_pretty].append(CallTarget(node.referenced))
+
+    for child in node.get_children():
+        show_info(child, xfiles, xprefs, cur_fun)
+
+
+# ── graph maintenance ────────────────────────────────────────────────────────
+
+g_fullname_keys = []
+
+
+def _build_index():
+    global g_fullname_keys
+    g_fullname_keys = sorted(FULLNAMES.keys())
+
+
+def _dedup_graphs():
+    for key in CALLGRAPH:
+        seen = set()
+        vals = []
+        for v in CALLGRAPH[key]:
+            if v not in seen:
+                seen.add(v); vals.append(v)
+        CALLGRAPH[key] = vals
+    for key in REFGRAPH:
+        seen = set(); vals = []
+        for v in REFGRAPH[key]:
+            if v not in seen:
+                seen.add(v); vals.append(v)
+        REFGRAPH[key] = vals
+
+
+def _fullname_matches(prefix: str):
+    lo = bisect.bisect_left(g_fullname_keys, prefix)
+    hi = bisect.bisect_left(g_fullname_keys, prefix + '\uffff')
+    for key in g_fullname_keys[lo:hi]:
+        for dn in sorted(FULLNAMES[key]):
+            yield dn
+
+
+# ── persistent cache ─────────────────────────────────────────────────────────
+
+CACHE_DIR = os.path.expanduser('~/.cache/clang-callgraph')
+
+
+def _cache_key(cfg):
+    h = hashlib.sha256()
+    if os.path.isfile(cfg['db']):
+        with open(cfg['db'], 'rb') as f:
+            h.update(f.read())
+    else:
+        h.update(cfg['db'].encode())
+    for k in ('clang_args', 'excluded_prefixes', 'excluded_paths'):
+        h.update(json.dumps(cfg[k], sort_keys=True).encode())
+    return h.hexdigest()
+
+
+def _cache_path(cfg):
+    return os.path.join(CACHE_DIR, _cache_key(cfg) + '.pickle')
+
+
+def _load_cache(cfg):
+    path = _cache_path(cfg)
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        CALLGRAPH.clear(); REFGRAPH.clear(); FULLNAMES.clear()
+        CALLGRAPH.update(data['callgraph'])
+        REFGRAPH.update(data['refgraph'])
+        FULLNAMES.update(data['fullnames'])
+        _build_index()
+        return True
+    except Exception:
+        return False
+
+
+def _save_cache(cfg):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(_cache_path(cfg), 'wb') as f:
+            pickle.dump({'callgraph': dict(CALLGRAPH),
+                         'refgraph':  dict(REFGRAPH),
+                         'fullnames': dict(FULLNAMES)}, f,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass
+
+
+def _clear_cache_dir() -> int:
+    """Remove all cached pickle files.  Returns count of removed files."""
+    if not os.path.isdir(CACHE_DIR):
+        return 0
+    removed = 0
+    for fn in os.listdir(CACHE_DIR):
+        if fn.endswith('.pickle'):
+            os.unlink(os.path.join(CACHE_DIR, fn))
+            removed += 1
+    return removed
+
+
+# ── tree walkers (output to g_buffer) ────────────────────────────────────────
+
+def _depth_guard(depth):
+    if depth >= g_depth:
+        return True
+    if depth >= MAX_DEPTH:
+        g_buffer.append('...<too deep>...')
+        return True
+    return False
+
+
+def print_refs(fun_name, so_far, depth=0):
+    if _depth_guard(depth):
+        return
+    if fun_name not in REFGRAPH:
+        return
+    for caller in REFGRAPH[fun_name]:
+        g_buffer.append(f'{C_RED}|{C_RESET}  ' * depth
+                        + f'{C_RED}|--{C_RESET}' + _color(caller))
+        if caller in so_far:
+            continue
+        so_far.append(caller)
+        if caller in REFGRAPH:
+            print_refs(caller, so_far, depth + 1)
+
+
+def _recurse_ct(ct, so_far, depth, walker):
+    key = ct.fq_pretty if ct.fq_pretty in CALLGRAPH else ct.fq
+    if key in CALLGRAPH:
+        walker(key, so_far, depth + 1)
+
+
+def print_calls(fun_name, so_far, depth=0):
+    if _depth_guard(depth):
+        return
+    if fun_name not in CALLGRAPH:
+        return
+    for ct in CALLGRAPH[fun_name]:
+        g_buffer.append(f'{C_GREEN}|{C_RESET}  ' * depth
+                        + f'{C_GREEN}|--{C_RESET}' + _color(ct.display()))
+        if ct in so_far:
+            continue
+        so_far.append(ct)
+        _recurse_ct(ct, so_far, depth, print_calls)
+
+
+def filter_calls(fun_name, call_stack, so_far, depth=0):
+    if _depth_guard(depth):
+        return
+    if fun_name not in CALLGRAPH:
+        return
+    for ct in CALLGRAPH[fun_name]:
+        line = (f'{C_GREEN}|{C_RESET}  ' * depth
+                + f'{C_GREEN}|--{C_RESET}' + _color(ct.display()))
+        call_stack.append(line)
+        if any(kw in ct.displayname for kw in g_filter_set):
+            for stacked in call_stack:
+                g_buffer.append(stacked)
+        if ct in so_far:
+            call_stack.pop()
+            continue
+        so_far.append(ct)
+        key = ct.fq_pretty if ct.fq_pretty in CALLGRAPH else ct.fq
+        if key in CALLGRAPH:
+            filter_calls(key, call_stack, so_far, depth + 1)
+        call_stack.pop()
+
+
+def ignore_calls(fun_name, so_far, depth=0):
+    if _depth_guard(depth):
+        return
+    if fun_name not in CALLGRAPH:
+        return
+    for ct in CALLGRAPH[fun_name]:
+        if any(kw in ct.displayname for kw in g_ignore_set):
+            continue
+        g_buffer.append(f'{C_GREEN}|{C_RESET}  ' * depth
+                        + f'{C_GREEN}|--{C_RESET}' + _color(ct.display()))
+        if ct in so_far:
+            continue
+        so_far.append(ct)
+        _recurse_ct(ct, so_far, depth, ignore_calls)
+
+
+# ── output entry points ──────────────────────────────────────────────────────
+
+def _flush(show_count=False):
+    if show_count:
+        n = len(g_buffer)
+        g_buffer.append(f'{C_GREEN}[total lines: {n}]{C_RESET}')
     for line in g_buffer:
         print(line)
     g_buffer.clear()
 
 
-def buffer_clear():
-    g_buffer.clear()
+def _print_matching(fun):
+    print(f'{C_YELLOW}matching list:{C_RESET}')
+    matches = []
+    for dn in _fullname_matches(fun):
+        matches.append(dn)
+        g_buffer.append(_color(dn))
+    if matches:
+        set_complete_list(matches)
+    _flush(True)
 
 
-def progress_update(msg: str, force: bool=False) -> None:
-    global g_progress_active
-    global g_progress_last_update
-    if not g_progress_tty:
-        return
-    now = time.perf_counter()
-    if not force and now - g_progress_last_update < 0.2:
-        return
-    width = max(20, shutil.get_terminal_size(fallback=(120, 20)).columns - 1)
-    line = msg[:width]
-    sys.stderr.write(f'\r\x1b[2K{line}')
-    sys.stderr.flush()
-    g_progress_active = True
-    g_progress_last_update = now
-
-
-def progress_finish() -> None:
-    global g_progress_active
-    if not g_progress_tty:
-        return
-    if g_progress_active:
-        sys.stderr.write('\r\x1b[2K\n')
-        sys.stderr.flush()
-        g_progress_active = False
-
-
-def fully_qualified(c) -> str:
-    if c is None:
-        return ''
-    elif c.kind == CursorKind.TRANSLATION_UNIT:
-        return ''
+def print_callgraph(fun):
+    print()
+    if fun in CALLGRAPH:
+        g_buffer.append(_color(fun))
+        print_calls(fun, [])
+        _seed_completer(fun)
+        _flush(True)
     else:
-        res = fully_qualified(c.semantic_parent)
-        if res != '':
-            return res + '::' + c.spelling
-        return c.spelling
+        _print_matching(fun)
 
 
-def fully_qualified_pretty(c) -> str:
-    if c is None:
-        return ''
-    elif c.kind == CursorKind.TRANSLATION_UNIT:
-        return ''
+def print_refgraph(fun):
+    print()
+    if fun in REFGRAPH:
+        g_buffer.append(fun)
+        print_refs(fun, [])
     else:
-        res = fully_qualified(c.semantic_parent)
-        if res != '':
-            return res + '::' + c.displayname
-        return c.displayname
+        found = False
+        for dn in _fullname_matches(fun):
+            if dn in REFGRAPH:
+                found = True
+                g_buffer.append(dn)
+                print_refs(dn, [])
+        if not found:
+            print(f'{C_YELLOW}no references found for: {fun}{C_RESET}')
+    _flush(True)
 
 
-def is_excluded(node, xfiles, xprefs) -> bool:
-    if not node.extent.start.file:
-        return False
-
-    for xf in xfiles:
-        if node.extent.start.file.name.startswith(xf):
-            return True
-
-    fqp: str = fully_qualified_pretty(node)
-
-    for xp in xprefs:
-        if fqp.startswith(xp):
-            return True
-
-    return False
+def print_filter_callgraph(fun, call_stack):
+    print()
+    if fun in CALLGRAPH:
+        g_buffer.append(_color(fun))
+        filter_calls(fun, call_stack, [])
+    _flush(True)
 
 
-def show_info(node, xfiles, xprefs, cur_fun=None) -> None:
-    if node.kind == CursorKind.FUNCTION_TEMPLATE:
-        if not is_excluded(node, xfiles, xprefs):
-            cur_fun = node
-            FULLNAMES[fully_qualified(cur_fun)].add(
-                fully_qualified_pretty(cur_fun))
-
-    if node.kind == CursorKind.CXX_METHOD or \
-            node.kind == CursorKind.FUNCTION_DECL:
-        if not is_excluded(node, xfiles, xprefs):
-            cur_fun = node
-            FULLNAMES[fully_qualified(cur_fun)].add(
-                fully_qualified_pretty(cur_fun))
-
-    if node.kind == CursorKind.CALL_EXPR:
-        if node.referenced and not is_excluded(node.referenced, xfiles, xprefs):
-            ref_pretty = fully_qualified_pretty(node.referenced)
-            cur_pretty = fully_qualified_pretty(cur_fun)
-            location = node.location
-            loc_key = (
-                location.file.name if location.file else '',
-                location.line,
-                location.column,
-                ref_pretty,
-            )
-            if os.environ.get('CLANG_CALLGRAPH_DEBUG_CALLS') == cur_pretty:
-                semantic_parent = fully_qualified_pretty(node.semantic_parent) if node.semantic_parent else ''
-                lexical_parent = fully_qualified_pretty(node.lexical_parent) if node.lexical_parent else ''
-                sys.stderr.write(
-                    "debug call: "
-                    f"caller={cur_pretty} callee={ref_pretty} loc={loc_key} "
-                    f"semantic_parent={semantic_parent} lexical_parent={lexical_parent}\n"
-                )
-                sys.stderr.flush()
-            if loc_key not in CALLSITE_SEEN[cur_pretty]:
-                CALLSITE_SEEN[cur_pretty].add(loc_key)
-                if cur_pretty not in REFGRAPH[ref_pretty]:
-                    REFGRAPH[ref_pretty].append(cur_pretty)
-                CALLGRAPH[cur_pretty].append(node.referenced)
-            elif os.environ.get('CLANG_CALLGRAPH_DEBUG_CALLS') == cur_pretty:
-                sys.stderr.write(f"debug duplicate-suppressed: caller={cur_pretty} callee={ref_pretty} loc={loc_key}\n")
-                sys.stderr.flush()
-
-    for c in node.get_children():
-        show_info(c, xfiles, xprefs, cur_fun)
+def print_ignore_callgraph(fun):
+    print()
+    if fun in CALLGRAPH:
+        g_buffer.append(_color(fun))
+        ignore_calls(fun, [])
+    _flush(True)
 
 
-def pretty_print(n) -> str:
-    if isinstance(n, dict):
-        return pretty_print_cached(n)
+# ── readline ─────────────────────────────────────────────────────────────────
 
-    v = ''
-    if n.is_virtual_method():
-        v = ' virtual'
-    if n.is_pure_virtual_method():
-        v = ' = 0'
-    return fully_qualified_pretty(n) + v
+complete_list    = []
+_complete_cache  = []
 
 
-def code_color_pretty(code: str) -> str:
-    formatter: TerminalFormatter = TerminalFormatter()
-    highlight_code = highlight(code, CLexer(), formatter)
-    return highlight_code.rstrip()
+def complete(text, state):
+    global _complete_cache
+    if state == 0:
+        _complete_cache = [c for c in complete_list if c.startswith(text)]
+    try:
+        return _complete_cache[state]
+    except IndexError:
+        return None
 
 
-def print_refs(fun_name: str, so_far: list, depth: int=0) -> None:
-    if depth >= g_print_depth:
+def set_complete_list(lst):
+    global complete_list
+    complete_list = lst
+
+
+def _seed_completer(prefix):
+    matches = list(_fullname_matches(prefix))
+    if matches:
+        set_complete_list(matches)
+
+
+def _setup_readline():
+    if readline is None:
         return
-    if depth >= g_max_print_depth:
-        buffer_append('...<too deep>...')
+    try:
+        readline.parse_and_bind('tab: complete')
+    except Exception:
+        pass
+    readline.set_completer(complete)
+    try:
+        readline.read_history_file(HISTORY_FILE)
+    except (FileNotFoundError, PermissionError):
+        pass
+    readline.set_history_length(HISTORY_LEN)
+    atexit.register(_save_history)
+
+
+def _save_history():
+    if readline is None:
         return
-    if fun_name in REFGRAPH:
-        for f in REFGRAPH[fun_name]:
-            color_code = code_color_pretty(f)
-            buffer_append(f'{ctrl_red}|{ctrl_reset}  ' * depth + f'{ctrl_red}|--{ctrl_reset}' + color_code)
-            if f in so_far:
-                continue
-            so_far.append(f)
-            if f in REFGRAPH:
-                print_refs(f, so_far, depth+1)
-
-def print_calls(fun_name: str, so_far: list, depth: int=0) -> None:
-    if depth >= g_print_depth:
-        return
-    if depth >= g_max_print_depth:
-        buffer_append('...<too deep>...')
-        return
-    if fun_name in CALLGRAPH:
-        for f in CALLGRAPH[fun_name]:
-            color_code = code_color_pretty(pretty_print(f))
-            buffer_append(f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code)
-
-            node_key = cursor_key(f)
-            if node_key in so_far:
-                continue
-            so_far.append(node_key)
-            if node_key in CALLGRAPH:
-                print_calls(node_key, so_far, depth + 1)
-            elif not isinstance(f, dict):
-                print_calls(fully_qualified(f), so_far, depth + 1)
+    try:
+        readline.write_history_file(HISTORY_FILE)
+    except (OSError, PermissionError):
+        pass
 
 
-def filter_calls(func_name: str, call_stack: list, so_far: list, depth: int=0) -> None:
-    if depth >= g_print_depth:
-        return
-    if depth >= g_max_print_depth:
-        buffer_append('...<too deep>...')
-        return
+# ── CLI ──────────────────────────────────────────────────────────────────────
 
-    if func_name in CALLGRAPH:
-        for f in CALLGRAPH[func_name]:
-            color_code: str = code_color_pretty(pretty_print(f))
-            line: str = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
-            call_stack.append(line)
-
-            displayname = f['displayname'] if isinstance(f, dict) else f.displayname
-            for kw in g_filter_set:
-                if kw in displayname:
-                    for line in call_stack:
-                        buffer_append(line)
-                    break
-
-            node_key = cursor_key(f)
-            if node_key in so_far:
-                call_stack.pop()
-                continue
-            so_far.append(node_key)
-            if node_key in CALLGRAPH:
-                filter_calls(node_key, call_stack, so_far, depth+1)
-            elif not isinstance(f, dict):
-                filter_calls(fully_qualified(f), call_stack, so_far, depth+1)
-            call_stack.pop()
-
-
-def ignore_calls(func_name: str, so_far: list, depth: int=0) -> None:
-    if depth >= g_print_depth:
-        return
-    if depth >= g_max_print_depth:
-        buffer_append('...<too deep>...')
-        return
-
-    if func_name in CALLGRAPH:
-        for f in CALLGRAPH[func_name]:
-            hit_ignore: bool = False
-            displayname = f['displayname'] if isinstance(f, dict) else f.displayname
-            for kw in g_ignore_set:
-                if kw in displayname:
-                    hit_ignore = True
-                    break
-            if hit_ignore:
-                continue
-
-            color_code: str = code_color_pretty(pretty_print(f))
-            line: str = f'{ctrl_green}|{ctrl_reset}  ' * (depth) + f'{ctrl_green}|--{ctrl_reset}' + color_code
-            buffer_append(line)
-
-            node_key = cursor_key(f)
-            if node_key in so_far:
-                continue
-            so_far.append(node_key)
-            if node_key in CALLGRAPH:
-                ignore_calls(node_key, so_far, depth + 1)
-            elif not isinstance(f, dict):
-                ignore_calls(fully_qualified(f), so_far, depth + 1)
-
-
-def check_libclang_exists(directory: str) -> bool:
-    """ Find if libclang-14.so exists in directory.
-    """
-    if not os.path.exists(directory):
-        return False
-
-    lib_path: str = os.path.join(directory, "libclang-14.so")
-    return os.path.isfile(lib_path)
-
-
-def read_compile_commands(filename: str) -> list:
+def read_compile_commands(filename):
     if filename.endswith('.json'):
-        with open(filename) as compdb:
-            return json.load(compdb)
-    else:
-        return [{'command': '', 'file': filename}]
+        try:
+            with open(filename) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            print(f'{C_RED}error reading {filename}: {e}{C_RESET}')
+            return []
+    if os.path.isdir(filename):
+        print(f'{C_YELLOW}warning: {filename} is a directory, skipping{C_RESET}')
+        return []
+    return [{'command': '', 'file': filename}]
 
 
-def serialize_cursor(node) -> dict:
-    return {
-        'spelling': node.spelling,
-        'displayname': node.displayname,
-        'is_virtual_method': node.is_virtual_method(),
-        'is_pure_virtual_method': node.is_pure_virtual_method(),
-    }
-
-
-def cursor_key(node) -> str:
-    if isinstance(node, dict):
-        return node['displayname'] if node['displayname'] else node['spelling']
-    return fully_qualified_pretty(node)
-
-
-def pretty_print_cached(node: dict) -> str:
-    v = ''
-    if node['is_virtual_method']:
-        v = ' virtual'
-    if node['is_pure_virtual_method']:
-        v = ' = 0'
-    return cursor_key(node) + v
-
-
-def get_cache_path(cfg: dict) -> Path:
-    db_path: str = os.path.abspath(cfg['db'])
-    stat = os.stat(db_path)
-    payload = {
-        'db': db_path,
-        'mtime_ns': stat.st_mtime_ns,
-        'size': stat.st_size,
-        'clang_args': cfg['clang_args'],
-        'excluded_prefixes': cfg['excluded_prefixes'],
-        'excluded_paths': cfg['excluded_paths'],
-        'library_path': cfg['library_path'],
-        'cache_version': CACHE_VERSION,
-    }
-    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
-    cache_dir = Path(db_path).parent / '.clang-callgraph-cache'
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / f'{digest}.json'
-
-
-def save_cache(cache_path: Path) -> None:
-    data = {
-        'callgraph': dict(CALLGRAPH),
-        'fullnames': {k: sorted(v) for k, v in FULLNAMES.items()},
-        'refgraph': dict(REFGRAPH),
-        'stats': LAST_LOAD_STATS,
-    }
-    cache_path.write_text(json.dumps(data, sort_keys=True), encoding='utf-8')
-
-
-def load_cache(cache_path: Path) -> bool:
-    if not cache_path.exists():
-        return False
-    data = json.loads(cache_path.read_text(encoding='utf-8'))
-
-    CALLGRAPH.clear()
-    for key, values in data['callgraph'].items():
-        CALLGRAPH[key].extend(values)
-
-    FULLNAMES.clear()
-    for key, values in data['fullnames'].items():
-        FULLNAMES[key].update(values)
-
-    REFGRAPH.clear()
-    for key, values in data['refgraph'].items():
-        REFGRAPH[key].extend(values)
-
-    LAST_LOAD_STATS.clear()
-    LAST_LOAD_STATS.update(data.get('stats', {}))
-    return True
-
-
-def clear_cache_dir(cfg: dict) -> int:
-    cache_dir = get_cache_path(cfg).parent
-    if not cache_dir.exists():
-        return 0
-    removed = 0
-    for path in cache_dir.glob('*.json'):
-        path.unlink()
-        removed += 1
-    return removed
-
-
-def read_args(args: list) -> dict:
+def read_args(args):
     db = None
-    clang_args: list = []
-    excluded_prefixes: list = []
-    excluded_paths: list = []
-    config_filename: str = ""
-    lookup: str = ""
-    library_path: str = ""
-    clear_cache: bool = False
-    i: int = 0
+    clang_args, excluded_prefixes, excluded_paths = [], [], []
+    config_filename = lookup = library_path = ''
+    clear_cache = False
+    i = 0
     while i < len(args):
-        if args[i] == '-x':
+        a = args[i]
+        if a in ('-h', '--help'):
+            return {'help': True}
+        if a == '-x':
             i += 1
-            excluded_prefixes += args[i].split(',')
-        elif args[i] == '-p':
+            if i < len(args):
+                excluded_prefixes += [p for p in args[i].split(',') if p]
+        elif a == '-p':
             i += 1
-            excluded_paths += args[i].split(',')
-        elif args[i] == '--cfg':
+            if i < len(args):
+                excluded_paths += [p for p in args[i].split(',') if p]
+        elif a == '--cfg':
             i += 1
-            config_filename = args[i]
-        elif args[i] == '--lookup':
+            if i < len(args):
+                config_filename = args[i]
+        elif a == '--lookup':
             i += 1
-            lookup = args[i]
-        elif args[i] == '--library_path':
+            if i < len(args):
+                lookup = args[i]
+        elif a == '--library_path':
             i += 1
-            library_path = args[i]
-        elif args[i] == '--clear-cache':
+            if i < len(args):
+                library_path = args[i]
+        elif a == '--clear-cache':
             clear_cache = True
-        elif args[i][0] == '-':
-            clang_args.append(args[i])
+        elif a and a[0] == '-':
+            clang_args.append(a)
         else:
-            db = args[i]
+            db = a
         i += 1
 
-    if len(excluded_paths) == 0:
+    if not excluded_paths:
         excluded_paths.append('/usr')
-
-    # try to use compile_commands.json as default db
     if not db and os.path.exists('compile_commands.json'):
         db = 'compile_commands.json'
+    if db and os.path.isdir(db):
+        p = os.path.join(db, 'compile_commands.json')
+        if os.path.isfile(p):
+            db = p
 
-    return {
-        'db': db,
-        'clang_args': clang_args,
-        'excluded_prefixes': excluded_prefixes,
-        'excluded_paths': excluded_paths,
-        'config_filename': config_filename,
-        'lookup': lookup,
-        'ask': (not lookup),
-        'library_path': library_path,
-        'clear_cache': clear_cache
-    }
-
-
-def load_config_file(cfg: dict) -> None:
-    if cfg['config_filename']:
-        with open(cfg['config_filename'], 'r') as yamlfile:
-            data = yaml.load(yamlfile, Loader=yaml.FullLoader)
-            keys = ('clang_args', 'excluded_prefixes', 'excluded_paths', 'library_path')
-            for k in keys:
-                cfg[k] += data.get(k, [])
+    return {'db': db, 'clang_args': clang_args,
+            'excluded_prefixes': excluded_prefixes,
+            'excluded_paths': excluded_paths,
+            'config_filename': config_filename,
+            'lookup': lookup, 'ask': not lookup,
+            'library_path': library_path,
+            'clear_cache': clear_cache}
 
 
-def keep_arg(x: str) -> bool:
-    return x.startswith('-I') or x.startswith('-std=') or x.startswith('-D')
+def load_config_file(cfg):
+    if not cfg['config_filename']:
+        return
+    if yaml is None:
+        print(f'{C_RED}warning: pyyaml not installed, ignoring --cfg{C_RESET}')
+        return
+    with open(cfg['config_filename'], 'r') as f:
+        data = yaml.load(f, Loader=yaml.FullLoader)
+    for k in ('clang_args', 'excluded_prefixes', 'excluded_paths', 'library_path'):
+        val = data.get(k)
+        if val is None:
+            continue
+        if not isinstance(val, list):
+            print(f'{C_YELLOW}warning: config key {k!r} should be a list, '
+                  f'got {type(val).__name__}{C_RESET}')
+            val = [val]
+        cfg[k] += val
 
 
-def analyze_source_files(cfg: dict) -> None:
-    start_time: float = time.perf_counter()
-    cache_path: Path = get_cache_path(cfg)
-    compile_commands = read_compile_commands(cfg['db'])
-    if load_cache(cache_path):
-        LAST_LOAD_STATS.update({
-            'files_loaded': len(compile_commands),
-            'load_seconds': round(time.perf_counter() - start_time, 3),
-            'used_cache': True,
-            'functions_loaded': len(FULLNAMES),
-            'edges_loaded': sum(len(v) for v in CALLGRAPH.values()),
-        })
+def keep_arg(x):
+    return x.startswith(('-I', '-std=', '-D'))
+
+
+# ── main pipeline ────────────────────────────────────────────────────────────
+
+def _print_stats(nfiles, from_cache, elapsed):
+    nfuncs = sum(len(v) for v in FULLNAMES.values())
+    nedges = sum(len(v) for v in CALLGRAPH.values())
+    src = f'{C_GREEN}cache{C_RESET}' if from_cache else f'{C_YELLOW}parsed{C_RESET}'
+    print(f'{src} {nfiles} files, {nfuncs} functions, '
+          f'{nedges} call edges ({elapsed:.1f}s)')
+
+
+def analyze_source_files(cfg):
+    t0 = time.monotonic()
+
+    if _load_cache(cfg):
+        _print_stats(len(read_compile_commands(cfg['db'])), True,
+                     time.monotonic() - t0)
         return
 
-    print('reading source files...')
-    if cfg['library_path']:
-        if check_libclang_exists(cfg['library_path']):
-            Config.set_library_path(cfg['library_path'])
-        else:
-            print(f"{ctrl_red}cannot find libclang-14.so in {cfg['library_path']}, ignore library_path argument.{ctrl_reset}")
-
+    # clean slate before fresh parse
     CALLGRAPH.clear()
     FULLNAMES.clear()
     REFGRAPH.clear()
-    CALLSITE_SEEN.clear()
 
-    index: Index = Index.create()
-    total_commands = len(compile_commands)
-    for idx, cmd in enumerate(compile_commands, start=1):
-        # https://clang.llvm.org/docs/JSONCompilationDatabase.html#format
-        # either "arguments" or "command" is required.
-        if 'arguments' in cmd:
-            arguments = cmd['arguments']
-        else:
-            arguments = cmd['command'].split()
-        c = [x for x in arguments if keep_arg(x)] + cfg['clang_args']
+    if cfg['library_path'] and os.path.isfile(
+            os.path.join(cfg['library_path'], 'libclang-14.so')):
+        Config.set_library_path(cfg['library_path'])
+
+    cmds = read_compile_commands(cfg['db'])
+    index = Index.create()  # single Index for all files
+    for idx, cmd in enumerate(cmds, start=1):
+        wd = cmd.get('directory', '')
+        src = os.path.join(wd, cmd['file']) if wd else cmd['file']
+        argv = (cmd['arguments'] if 'arguments' in cmd
+                else cmd['command'].split())
+        cargs = [x for x in argv if keep_arg(x)] + cfg['clang_args']
 
         try:
-            tu: TranslationUnit = index.parse(cmd['file'], c)
-            progress_update(
-                f"loading {idx}/{total_commands} files, functions={len(FULLNAMES)}: {cmd['file']}",
-                force=(idx == 1 or idx == total_commands),
-            )
+            tu = index.parse(src, cargs)
+            _progress(f'{idx}/{len(cmds)}  {src}',
+                      force=(idx == 1 or idx == len(cmds)))
 
             for d in tu.diagnostics:
-                if d.severity == d.Error or d.severity == d.Fatal:
-                    break
+                if d.severity in (d.Error, d.Fatal):
+                    print(' '.join(cargs))
+                    pprint(('diags', [{'severity': d.severity,
+                                       'location': d.location,
+                                       'spelling': d.spelling,
+                                       'ranges': list(d.ranges),
+                                       'fixits': list(d.fixits)}
+                                      for d in tu.diagnostics]))
             show_info(tu.cursor, cfg['excluded_paths'], cfg['excluded_prefixes'])
-        except Exception as _:
-            print(f"failed parse file: {cmd['file']}")
+        except Exception:
+            print(f'failed parse file: {src}')
             traceback.print_exc()
 
-    serializable_callgraph = defaultdict(list)
-    for key, values in CALLGRAPH.items():
-        serializable_callgraph[key].extend(serialize_cursor(value) for value in values)
-    CALLGRAPH.clear()
-    for key, values in serializable_callgraph.items():
-        CALLGRAPH[key].extend(values)
-
-    progress_finish()
-    LAST_LOAD_STATS.clear()
-    LAST_LOAD_STATS.update({
-        'files_loaded': len(compile_commands),
-        'functions_loaded': len(FULLNAMES),
-        'edges_loaded': sum(len(v) for v in CALLGRAPH.values()),
-        'used_cache': False,
-        'load_seconds': round(time.perf_counter() - start_time, 3),
-    })
-    save_cache(cache_path)
+    _progress_finish()
+    _dedup_graphs()
+    _build_index()
+    _save_cache(cfg)
+    _print_stats(len(cmds), False, time.monotonic() - t0)
 
 
-def print_refgraph(fun: str) -> None:
-    print('')
-    if fun in REFGRAPH:
-        buffer_append(fun)
-        print_refs(fun, list())
-    buffer_flush(True)
+# ── REPL ─────────────────────────────────────────────────────────────────────
+
+def _repl_reset(_words):
+    g_filter_set.clear()
+    g_ignore_set.clear()
+    global g_depth
+    g_depth = MAX_DEPTH
+    print('reset finish')
 
 
-def print_callgraph(fun: str) -> None:
-    print('')
-    if fun in CALLGRAPH:
-        buffer_append(code_color_pretty(fun))
-        print_calls(fun, list())
-    else:
-        match_list: list = []
-        print(f'{ctrl_yellow}matching list:{ctrl_reset}')
-        for f, ff in FULLNAMES.items():
-            if f.startswith(fun):
-                for fff in ff:
-                    match_list.append(fff)
-                    buffer_append(code_color_pretty(fff))
-        if len(match_list) > 0:
-            set_complete_list(match_list)
-    buffer_flush(True)
+_REPL_CMDS = {
+    'show':   lambda _: (print(f'{C_GREEN}filter set: {g_filter_set}{C_RESET}'),
+                         print(f'{C_GREEN}ignore set: {g_ignore_set}{C_RESET}'),
+                         print(f'{C_GREEN}print depth: {g_depth}{C_RESET}'),
+                         print(f'{C_GREEN}max print depth: {MAX_DEPTH}{C_RESET}')),
+    'reset':  _repl_reset,
+    'filter': lambda ws: (g_filter_set.update(ws), print(
+        f'update filter set:{C_GREEN} {g_filter_set}{C_RESET}')),
+    'ignore': lambda ws: (g_ignore_set.update(ws), print(
+        f'update ignore set:{C_GREEN} {g_ignore_set}{C_RESET}')),
+    'depth':  lambda ws: _repl_depth(ws),
+    'del_ig': lambda ws: [g_ignore_set.discard(w) for w in ws],
+    'del_fi': lambda ws: [g_filter_set.discard(w) for w in ws],
+}
 
-
-def print_filter_callgraph(fun: str, call_stack: list) -> None:
-    print('')
-    if fun in CALLGRAPH:
-        buffer_append(code_color_pretty(fun))
-        filter_calls(fun, call_stack, list())
-    buffer_flush(True)
-
-
-def print_ignore_callgraph(fun: str) -> None:
-    print('')
-    if fun in CALLGRAPH:
-        buffer_append(code_color_pretty(fun))
-        ignore_calls(fun, list())
-    buffer_flush(True)
-
-
-usage_message: str = """
+_REPL_USAGE = f"""{C_GREEN}
 Usage:
     @ ignore keyword1 [keyword2] ...    add ignore keywords
     @ filter keyword1 [keyword2] ...    add filter keywords
@@ -627,118 +680,115 @@ Usage:
     ? complete_function_name            show call graph to function contain 'filter' keywords
     ! complete_function_name            show call graph without 'ignore' keywords
     & complete_function_name            show reference of function
-"""
+{C_RESET}"""
 
-def ask_and_print_callgraph() -> None:
+
+def _repl_depth(words):
+    global g_depth
     try:
-        fun: str = input(f'>>> ')
-        if not fun or len(fun.strip()) <= 0:
+        n = int(words[0])
+    except (ValueError, IndexError):
+        print(_REPL_USAGE)
+        return
+    if 1 <= n < MAX_DEPTH:
+        g_depth = n
+    else:
+        print(_REPL_USAGE)
+
+
+def ask_and_print_callgraph():
+    try:
+        line = input('>>> ').strip()
+        if not line:
+            return
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise
+
+    try:
+        if line.startswith('@'):
+            parts = line.split()
+            if len(parts) <= 1:
+                print(_REPL_USAGE)
+                return
+            handler = _REPL_CMDS.get(parts[1])
+            if handler:
+                handler(parts[2:])
+            else:
+                print(_REPL_USAGE)
             return
 
-        fun = fun.strip()
-        # special commmad
-        if fun.startswith('@'):
-            global g_print_depth
-            args: list[str] = fun.split(' ')
-            if len(args) <= 1:
-                print(f'{ctrl_green}{usage_message}{ctrl_reset}')
-                return
-            if args[1] == 'reset':
-                g_filter_set.clear()
-                g_ignore_set.clear()
-                g_print_depth = g_max_print_depth
-                print("reset finish")
-                return
-            if args[1] == 'show':
-                print(f'{ctrl_green}filter set: {g_filter_set}{ctrl_reset}')
-                print(f'{ctrl_green}ignore set: {g_ignore_set}{ctrl_reset}')
-                print(f'{ctrl_green}print depth: {g_print_depth}{ctrl_reset}')
-                print(f'{ctrl_green}max print depth: {g_max_print_depth}{ctrl_reset}')
-                return
-            if args[1] == 'filter':
-                for keyword in args[2:]:
-                    g_filter_set.add(keyword)
-                print(f'update filter set:{ctrl_green} {g_filter_set}{ctrl_reset}')
-                return
-            if args[1] == 'ignore':
-                for keyword in args[2:]:
-                    g_ignore_set.add(keyword)
-                print(f'update ignore set:{ctrl_green} {g_ignore_set}{ctrl_reset}')
-                return
-            if args[1] == 'depth':
-                depth: int = int(args[2])
-                if depth <= 0 or depth >= g_max_print_depth:
-                    print(usage_message)
-                    return
-                g_print_depth = depth
-                return
-            if args[1] == 'del_ig':
-                for kw in args[2:]:
-                    g_ignore_set.remove(kw)
-                return
-            if args[1] == 'del_fi':
-                for kw in args[2:]:
-                    g_filter_set.remove(kw)
-                return
-
-        if fun.startswith('?'):
-            args = fun.split(' ', 1)
-            start_func: str = args[1]
-            call_stack: list = []
-            print_filter_callgraph(start_func, call_stack)
+        prefix, _, rest = line.partition(' ')
+        prefix_map = {
+            '?': lambda r: print_filter_callgraph(r, []),
+            '!': print_ignore_callgraph,
+            '&': print_refgraph,
+        }
+        if prefix in prefix_map:
+            prefix_map[prefix](rest)
             return
 
-        if fun.startswith("!"):
-            args = fun.split(' ', 1)
-            start_func: str = args[1]
-            print_ignore_callgraph(start_func)
-            return
-
-        if fun.startswith("&"):
-            args = fun.split(' ', 1)
-            start_func: str = args[1]
-            print_refgraph(start_func)
-            return
-
-        # just find all function with keyword or print call graph
-        print_callgraph(fun)
-
-    except Exception as _:
-        buffer_clear()
+        print_callgraph(line)
+    except Exception:
+        g_buffer.clear()
         traceback.print_exc()
 
 
-def main() -> None:
-    cfg: dict = read_args(sys.argv[1:])
+# ── entry point ──────────────────────────────────────────────────────────────
+
+CLI_USAGE = f"""Usage: clang-callgraph <file.cpp|compile_commands.json|directory> [options] [clang args...]
+
+Generate an interactive call graph from C/C++ source code.
+
+Arguments:
+  <input>       Source file (.cpp/.c), compilation database (.json),
+                or directory (looks for compile_commands.json inside).
+                If omitted, defaults to ./compile_commands.json
+
+Options:
+  -x P1,P2      Exclude symbols by name prefix (e.g. std::,boost::)
+  -p P1,P2      Exclude symbols defined in these path prefixes
+  --cfg FILE    YAML config file for excluded_prefixes, excluded_paths,
+                clang_args, library_path
+  --lookup FUNC Non-interactive mode: print callgraph and exit
+  --library_path PATH  Path to directory containing libclang-14.so
+  --clear-cache Remove all cached parse results
+  -h, --help    Show this help message and exit
+"""
+
+
+def main():
+    _setup_readline()
+
+    cfg = read_args(sys.argv[1:])
+    if cfg.get('help'):
+        print(CLI_USAGE)
+        return
     if cfg['db'] is None:
-        print('usage: ' + sys.argv[0] + ' file.cpp|compile_database.json '
+        print(f'usage: {sys.argv[0]} file.cpp|compile_database.json '
               '[extra clang args...]')
         return
 
     load_config_file(cfg)
 
-    if cfg['clear_cache']:
-        removed = clear_cache_dir(cfg)
-        print(f'cleared cache files: {removed}')
+    if cfg.get('clear_cache'):
+        n = _clear_cache_dir()
+        print(f'cleared {n} cache file(s)')
         return
 
     analyze_source_files(cfg)
-    if LAST_LOAD_STATS:
-        print(
-            'load summary: '
-            f"files={LAST_LOAD_STATS.get('files_loaded', 0)}, "
-            f"functions={LAST_LOAD_STATS.get('functions_loaded', 0)}, "
-            f"edges={LAST_LOAD_STATS.get('edges_loaded', 0)}, "
-            f"seconds={LAST_LOAD_STATS.get('load_seconds', 0)}, "
-            f"cache={'yes' if LAST_LOAD_STATS.get('used_cache') else 'no'}"
-        )
 
     if cfg['lookup']:
         print_callgraph(cfg['lookup'])
     if cfg['ask']:
         while True:
-            ask_and_print_callgraph()
+            try:
+                ask_and_print_callgraph()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
 
 
 if __name__ == '__main__':
+    signal.signal(signal.SIGINT, lambda *_: (print('user exit.'), sys.exit(0)))
     main()

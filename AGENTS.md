@@ -1,156 +1,107 @@
 # AGENTS.md
 
-## Project overview
-- `clang-callgraph` is a small Python CLI package for generating call graphs from C/C++ codebases via Clang AST parsing.
-- The package entry point is `clang_callgraph:main`, exposed as the `clang-callgraph` console script in `pyproject.toml`.
-- Almost all implementation currently lives in a single module: `clang_callgraph/__init__.py`.
+## Project Overview
 
-## Repository layout
-- `pyproject.toml` — Poetry package metadata, dependencies, and console script entry point.
-- `README.md` — user-facing installation, usage, and configuration examples.
-- `clang_callgraph/__init__.py` — CLI argument parsing, compile database loading, Clang traversal, graph building, and interactive query loop.
-- `LICENSE` — project license.
+`clang-callgraph` is a Python CLI tool that uses libclang to generate interactive call graphs from C/C++ codebases. It parses source files through a `compile_commands.json` compilation database, builds a call graph in memory, then drops into an interactive REPL for querying.
 
-## Tooling and environment
-### Observed dependencies
-From `pyproject.toml`:
-- Python `>=3.6`
-- Runtime: `clang>=14.0.0`, `pygments>=2.0.0`, `pyyaml>=5.4.1`
-- Dev: `pytest>=8.0.0`
+## Build & Run
 
-### External system requirements
-From `README.md` and code:
-- A Clang/libclang 14 installation is expected.
-- The code checks for `libclang-14.so` when `--library_path` is provided.
-- Typical setup mentioned in `README.md`:
-  - `clang-14`
-  - `libclang-14-dev`
-- For analyzing Make-based C/C++ projects, the README recommends generating `compile_commands.json` with Bear.
+- **Install**: `pip install .` (uses Poetry build system via `pyproject.toml`)
+- **Run**: `clang-callgraph <file.cpp | compile_commands.json | directory> [options] [clang args...]`
+- **Run (without install)**: `python -m clang_callgraph <file.cpp | compile_commands.json | directory>`
+- **Help**: `clang-callgraph -h` / `clang-callgraph --help`
+- **Clear cache**: `clang-callgraph --clear-cache`
+- **Syntax check**: `python3 -m py_compile clang_callgraph/__init__.py`
+- **Dev dependency**: `pytest>=8.0.0` declared in `pyproject.toml`; no test suite exists yet.
 
-## Commands
-Only include commands observed in repository files.
+## Architecture
 
-### Install
-```bash
-pip install .
-```
+The entire application lives in a single file: `clang_callgraph/__init__.py` (~730 lines).
 
-### Run the CLI
-Via console script after installation:
-```bash
-clang-callgraph file.cpp
-clang-callgraph compile_commands.json
-```
+### Data Flow
 
-Via module from the repo checkout:
-```bash
-python -m clang_callgraph file.cpp
-python -m clang_callgraph compile_commands.json
-```
+1. `main()` → `read_args()` parses CLI args
+2. `load_config_file()` merges YAML config if `--cfg` provided
+3. `analyze_source_files()` iterates compilation units, spawns a libclang `TranslationUnit` per file, recursively walks the AST via `show_info()`
+4. `show_info()` populates three global dicts: `CALLGRAPH`, `REFGRAPH`, `FULLNAMES`
+5. REPL loop (`ask_and_print_callgraph()`) accepts queries and renders subgraphs
 
-### Tests
-Declared dev dependency:
-```bash
-pytest
-```
-Current environment note: `pytest` was not installed in the working environment when this file was generated.
+### Key Global State
 
-### Generate compilation database for Make projects
-Documented in `README.md`:
-```bash
-bear -- make -j4
-```
+| Variable | Purpose |
+|---|---|
+| `CALLGRAPH` | `defaultdict(list)`: caller → list of `CallTarget` objects |
+| `REFGRAPH` | `defaultdict(list)`: callee → list of caller display names |
+| `FULLNAMES` | `defaultdict(set)`: spelling-qualified name → set of display names |
+| `CallTarget` | Serializable value-object. Fields: `displayname`, `virtual`, `pure_virtual`, `fq_pretty`, `fq`. `__eq__`/`__hash__` on `fq_pretty`. |
+| `g_fullname_keys` | Sorted FULLNAMES keys for `bisect` prefix lookup |
+| `g_buffer` | Accumulates output lines before flushing to stdout |
+| `g_filter_set` / `g_ignore_set` | Keywords for inclusive/exclusive filtering |
+| `g_depth` / `MAX_DEPTH` | Recursion depth limit (default 15) |
+| `_FORMATTER` / `_CLEXER` | Module-level pygments singletons |
+| `complete_list` | Readline tab-completion candidates |
+| `_PROGRESS_*` | Progress bar state for stderr during parsing |
 
-## CLI behavior
-Observed in `clang_callgraph/__init__.py`:
-- Positional input is either a source file or a `compile_commands.json` file.
-- If no database/file argument is passed and `compile_commands.json` exists in the current directory, the tool uses it automatically.
-- Supported explicit options:
-  - `-x name1,name2` — exclude symbol prefixes
-  - `-p path1,path2` — exclude file path prefixes
-  - `--cfg <file>` — load YAML config
-  - `--lookup <function_name>` — print one call graph without entering REPL
-  - `--library_path <dir>` — directory expected to contain `libclang-14.so`
-- Any other `-...` arguments are forwarded as Clang args, but only `-I...`, `-std=...`, and `-D...` survive filtering before parsing.
-- Default excluded path is `/usr` if `-p` / config excluded paths are not provided.
+## Dependencies
 
-## YAML config file
-Observed in `README.md` and `load_config_file()`:
-- Config format is YAML.
-- Recognized keys:
-  - `clang_args`
-  - `excluded_prefixes`
-  - `excluded_paths`
-  - `library_path`
-- `load_config_file()` appends values from YAML onto CLI-derived config lists.
-- Because the code does `cfg[k] += data.get(k, [])`, `library_path` is effectively treated like a list in config loading even though `read_args()` initializes it as a string. Be careful when changing this area.
+- **Hard requirement**: `libclang-14` (`apt install libclang-14-dev` on Ubuntu)
+- **Python**: `clang>=14.0.0`, `pygments>=2.0.0`, `pyyaml>=5.4.1`
+- Python ≥ 3.6
 
-## Code organization and flow
-### Main flow
-`clang_callgraph/__init__.py` is structured around a few global graphs and a top-level CLI flow:
-1. `read_args()` parses CLI input.
-2. `load_config_file()` merges YAML config.
-3. `analyze_source_files()` loads compilation commands and builds graphs.
-4. `main()` either:
-   - prints one graph with `--lookup`, or
-   - enters an interactive prompt via `ask_and_print_callgraph()`.
+## CLI & REPL Reference
 
-### Core global data structures
-- `CALLGRAPH = defaultdict(list)` — maps caller names to referenced callees.
-- `FULLNAMES = defaultdict(set)` — maps fully-qualified names to display-name variants.
-- `REFGRAPH = defaultdict(list)` — reverse references: callee to callers.
-- Several UI/query globals are also used (`g_filter_set`, `g_ignore_set`, `g_buffer`, depth globals).
+### CLI Options
 
-### AST traversal
-- `show_info()` recursively walks Clang cursors and populates `CALLGRAPH`, `REFGRAPH`, and `FULLNAMES`.
-- `fully_qualified()` and `fully_qualified_pretty()` build symbol names from `semantic_parent` chains.
-- Functions/methods/templates are tracked only for selected cursor kinds.
-- Call edges are captured from `CursorKind.CALL_EXPR` nodes.
+| Flag | Purpose |
+|---|---|
+| `-x prefix1,prefix2` | Exclude symbols by name prefix |
+| `-p path1,path2` | Exclude symbols by file path prefix (default: `/usr`) |
+| `--cfg config.yml` | YAML config file |
+| `--lookup func_name` | Non-interactive: print callgraph and exit |
+| `--library_path /path` | Path to `libclang-14.so` |
+| `--clear-cache` | Remove all cached parse results |
+| `-h, --help` | Show help |
 
-### Output/query modes
-Interactive prompt commands from `usage_message` and `ask_and_print_callgraph()`:
-- Plain input: search/match or print call graph.
-- `? function` — print only branches containing filter keywords.
-- `! function` — print graph while skipping ignored keywords.
-- `& function` — print reverse-reference graph.
-- `@ ...` commands mutate query state (`filter`, `ignore`, `del_fi`, `del_ig`, `depth`, `show`, `reset`).
+### REPL Commands
 
-## Coding patterns and conventions
-Observed patterns only:
-- Single-module implementation with heavy reliance on module-level mutable globals.
-- Recursive tree walking and recursive graph printing functions.
-- Type hints are present in many places, but usage is inconsistent:
-  - built-in generics like `list[str]`
-  - untyped parameters in many helper functions
-  - `dict`-shaped configs instead of dataclasses/TypedDicts
-- Console output is user-facing and ANSI-colorized using manual escape sequences plus Pygments terminal formatting.
-- Error handling is permissive:
-  - parse failures are caught broadly and logged with tracebacks
-  - diagnostics are printed, but processing continues
-- The package script entry point and the `if __name__ == '__main__':` block both call `main()` from the same module.
-
-## Testing status and guidance
-- There is currently no `tests/` directory or visible test suite in the repository.
-- `pytest` is declared as a dev dependency, so new tests should likely use pytest.
-- If adding tests, prefer focused unit tests around:
-  - `read_args()` parsing behavior
-  - config merging in `load_config_file()`
-  - filtering logic in `keep_arg()`
-  - graph/query helpers that can run without a real Clang installation
-- Integration tests that import `clang.cindex` may require libclang and are likely environment-sensitive.
+| Input | Action |
+|---|---|
+| `func_name` | Fuzzy match or print call graph |
+| `! func_name` | Call graph minus ignored keywords |
+| `? func_name` | Call graph filtered to matching keywords |
+| `& func_name` | Reverse reference graph (who calls this) |
+| `@ ignore kw1 kw2` | Add ignore keywords |
+| `@ filter kw1 kw2` | Add filter keywords |
+| `@ del_ig kw1 kw2` | Remove ignore keywords |
+| `@ del_fi kw1 kw2` | Remove filter keywords |
+| `@ depth N` | Set print depth (1–14) |
+| `@ show` | Display current config |
+| `@ reset` | Clear filters, reset depth |
 
 ## Gotchas
-- `python -m clang_callgraph --help` does not provide argparse-style help; importing the module immediately requires runtime dependencies such as `pyyaml` and `clang`.
-- The current environment used to inspect the repo did not have `pyyaml` installed, so module execution failed before CLI behavior could be exercised.
-- `pytest` was also missing from the current environment.
-- `analyze_source_files()` reparses each compile command entry with a new `Index.create()` call inside the loop.
-- `read_args()` treats unknown dashed arguments as Clang args, but `keep_arg()` later drops anything except `-I`, `-std=`, and `-D` prefixes.
-- `load_config_file()` concatenates config values into `cfg[k]`; this is natural for list fields but awkward for `library_path` because the initial type from `read_args()` is a string.
-- Excluded paths default to `/usr`, which hides many system headers unless explicitly overridden.
-- The readline completion state is global (`complete_list`) and updated only when a match list is produced.
 
-## Guidance for future changes
-- Read `clang_callgraph/__init__.py` end to end before changing behavior; most features interact through globals.
-- Preserve the CLI options and interactive command syntax documented in `README.md` unless intentionally updating both code and docs.
-- If refactoring globals into objects, audit all query/printing helpers together because they share state through module globals.
-- Keep README and this file aligned when changing dependencies, command examples, or config keys.
+- **Default db**: If no db given and `compile_commands.json` exists in CWD, it's used automatically. Directories look for `compile_commands.json` inside.
+- **Parse errors are non-fatal**: Continues parsing remaining files.
+- **`fully_qualified` vs `fully_qualified_pretty`**: `spelling` vs `displayname`. CALLGRAPH keys are display names; FULLNAMES maps spelling→display names.
+- **CALLGRAPH lookup fallback**: `print_calls()` tries `ct.fq_pretty` first, then `ct.fq`. Both are needed.
+- **Cursor objects are NOT hashable**: `Cursor.__hash__` is `None`. `CallTarget` wraps cursors with proper `__hash__`/`__eq__`.
+- **Parse cache**: `~/.cache/clang-callgraph/<sha256>.pickle`. Use `--clear-cache` to force re-parse.
+- **Single Index**: One `Index` object reused for all translation units.
+- **Progress bar**: Stderr shows `N/M  filepath` during fresh parse.
+- **Readline**: Guarded import with `pyreadline3` fallback. History at `~/.clang_callgraph_history`.
+- **SIGINT**: Caught — prints "user exit." and terminates.
+- **Colors**: Raw ANSI escape sequences — `C_GREEN`, `C_RED`, `C_YELLOW`, `C_RESET`.
+
+## Performance Optimizations
+
+| Optimization | Impact |
+|---|---|
+| Pygments singletons | No per-line object allocation |
+| CALLGRAPH/REFGRAPH dedup | Single edge per function pair |
+| FULLNAMES prefix index | O(log n) fuzzy lookup |
+| Readline completer caching | O(n) per tab-press |
+| Readline import guarding | Cross-platform |
+| Parse cache (pickle) | Near-instant subsequent runs |
+| Single Index reuse | Less libclang overhead |
+| Progress bar | Live feedback during parse |
+| Shared traversal helpers | `_recurse_ct`, `_depth_guard` |
